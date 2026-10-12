@@ -20,6 +20,14 @@ Output (for the simulator and `expert-bench`):
   <out>.prefill.npy  uint32 [sequences, layers, experts], prefill counts
   <out>.json      model shape plus one entry per sequence
 
+With --hidden, also the router input of every MoE layer (the training data
+for predictor.py), for all decode tokens plus every --hidden-stride-th
+prefill position:
+  <out>.hidden.bin  float16 [rows, layers, hidden]
+  <out>.hpicks.bin  uint8 [rows, layers, top_k], picks at those rows
+  rows per sequence go in <out>.json as hidden_start / hidden_prefill /
+  hidden_decode (prefill rows first, then the decode rows of the trace)
+
 Usage: uv run capture.py --out traces/qwen3-30b-a3b [--max-tokens 1024]
 """
 
@@ -50,6 +58,7 @@ class RouterRecorder(nn.Module):
         self.picks: list = []
         self.scores: list = []
         self.preds: list = []  # predictions for the next layer
+        self.hidden: list | None = None  # router inputs, with --hidden
 
     def _top(self, logits):
         # Softmax is monotonic, so ranking logits gives the router's top-k.
@@ -57,6 +66,8 @@ class RouterRecorder(nn.Module):
 
     def __call__(self, x):
         logits = self.inner(x)
+        if self.hidden is not None:
+            self.hidden.append(x.astype(mx.float16))
         top = self._top(logits)
         self.picks.append(top)
         w = mx.take_along_axis(mx.softmax(logits, axis=-1, precise=True), top.astype(mx.int32), axis=-1)
@@ -96,6 +107,31 @@ def split_calls(calls: list) -> tuple[np.ndarray, np.ndarray]:
     return cat(decode), cat(prefill)
 
 
+def drain_hidden(recs: list[RouterRecorder], stride: int):
+    """Router inputs and picks of one sequence, before drain() clears the picks:
+    (hidden [rows, L, D], picks [rows, L, k], prefill rows). Prefill rows are
+    every stride-th prompt position; all decode rows follow."""
+    hs, ps = [], []
+    for rec in recs:
+        mx.eval(rec.hidden)
+        dec_h, pre_h, dec_p, pre_p = [], [], [], []
+        for h, p in zip(rec.hidden, rec.picks):
+            h = np.array(h).reshape(-1, h.shape[-1])
+            p = np.array(p).reshape(-1, p.shape[-1])
+            if h.shape[0] == 1:
+                dec_h.append(h)
+                dec_p.append(p)
+            else:
+                pre_h.append(h)
+                pre_p.append(p)
+        rec.hidden.clear()
+        pre_h = np.concatenate(pre_h)[::stride] if pre_h else np.zeros((0, dec_h[0].shape[1]), np.float16)
+        pre_p = np.concatenate(pre_p)[::stride] if pre_p else np.zeros((0, dec_p[0].shape[1]), np.uint8)
+        hs.append(np.concatenate([pre_h] + dec_h))
+        ps.append(np.concatenate([pre_p] + dec_p))
+    return np.stack(hs, axis=1), np.stack(ps, axis=1), len(pre_h)
+
+
 def drain(recs: list[RouterRecorder], num_experts: int):
     """One sequence: (picks [T, L, k], scores [T, L, k], preds [T, L, k], prefill hist [L, E])."""
     picks, scores, preds = [], [], []
@@ -131,6 +167,8 @@ def main():
     ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--only", help="comma-separated prompt ids (default: all)")
+    ap.add_argument("--hidden", action="store_true", help="also save router inputs for predictor.py")
+    ap.add_argument("--hidden-stride", type=int, default=4, help="keep every n-th prefill position")
     args = ap.parse_args()
 
     prompts = PROMPTS
@@ -142,6 +180,14 @@ def main():
     model, tokenizer = load(args.model)
     recs, num_experts, top_k = install_recorders(model)
     print(f"{len(recs)} MoE layers, {num_experts} experts, top-{top_k}")
+    base = str(args.out)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    if args.hidden:
+        for rec in recs:
+            rec.hidden = []
+        hidden_f = open(base + ".hidden.bin", "wb")
+        hpicks_f = open(base + ".hpicks.bin", "wb")
+    hidden_rows = 0
 
     sampler = make_sampler(temp=args.temp, top_p=0.8)
     all_picks, all_scores, all_preds, hists, sequences, start = [], [], [], [], [], 0
@@ -157,6 +203,10 @@ def main():
             model, tokenizer, prompt, max_tokens=args.max_tokens, sampler=sampler
         ):
             n_out += 1
+        if args.hidden:
+            h, hp, n_pre = drain_hidden(recs, args.hidden_stride)
+            hidden_f.write(h.tobytes())
+            hpicks_f.write(hp.tobytes())
         picks, scores, preds, hist = drain(recs, num_experts)
         secs = time.perf_counter() - t0
         all_picks.append(picks)
@@ -175,14 +225,21 @@ def main():
                 "start": start,
             }
         )
+        if args.hidden:
+            if h.shape[0] - n_pre != picks.shape[0]:
+                raise SystemExit("hidden decode rows do not match the trace")
+            sequences[-1].update(hidden_start=hidden_rows, hidden_prefill=n_pre,
+                                 hidden_decode=h.shape[0] - n_pre)
+            hidden_rows += h.shape[0]
         start += picks.shape[0]
         print(
             f"[{i + 1}/{len(prompts)}] {p['id']:<22} prompt {len(prompt):>5} "
             f"decode {picks.shape[0]:>5}  {n_out / secs:5.1f} tok/s"
         )
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    base = str(args.out)
+    if args.hidden:
+        hidden_f.close()
+        hpicks_f.close()
     Path(base + ".bin").write_bytes(np.concatenate(all_picks).tobytes())
     Path(base + ".scores.bin").write_bytes(np.concatenate(all_scores).tobytes())
     Path(base + ".pred.bin").write_bytes(np.concatenate(all_preds).tobytes())
@@ -200,6 +257,9 @@ def main():
         "max_tokens": args.max_tokens,
         "sequences": sequences,
     }
+    if args.hidden:
+        meta.update(hidden_size=int(h.shape[-1]), hidden_rows=hidden_rows,
+                    hidden_dtype="float16", hidden_stride=args.hidden_stride)
     Path(base + ".json").write_text(json.dumps(meta, indent=2) + "\n")
     print(f"saved {start} decode tokens to {base}.bin")
 

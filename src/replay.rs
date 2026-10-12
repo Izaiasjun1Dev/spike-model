@@ -4,7 +4,8 @@
 //! The trace comes from `tools/routing-trace/capture.py`: per decode token and
 //! MoE layer, the top-k experts the router picked (`<trace>.bin`) and the
 //! pre-gated prediction for that layer made one layer earlier
-//! (`<trace>.pred.bin`). Expert (layer, e) lives at a fixed offset of the test
+//! (`<trace>.pred.bin`), or a trained predictor's ranked guesses made `d`
+//! layers earlier (`<trace>.pred<d>.bin`, from tools/routing-trace/predictor.py). Expert (layer, e) lives at a fixed offset of the test
 //! file, sized like the target model's experts, so the bytes moved per miss
 //! are the real ones even when the trace came from a smaller proxy model.
 //!
@@ -43,6 +44,9 @@ pub struct Trace {
     pub top_k: usize,
     pub picks: Vec<u8>,
     pub preds: Option<Vec<u8>>,
+    /// Predictions per (token, layer) row: top_k for `.pred.bin`, more for
+    /// `.pred<d>.bin`, ranked best first.
+    pub pred_width: usize,
     /// Router weight of each pick, f16 bits (`<trace>.scores.bin`).
     pub scores: Option<Vec<u16>>,
     pub seqs: Vec<Sequence>,
@@ -72,7 +76,8 @@ fn json_strs(json: &str, key: &str) -> Vec<String> {
 }
 
 impl Trace {
-    pub fn load(base: &str) -> Result<Self, String> {
+    /// `pred_dist` 1 reads the pre-gate `.pred.bin`, d > 1 reads `.pred<d>.bin`.
+    pub fn load(base: &str, pred_dist: usize) -> Result<Self, String> {
         let read = |ext: &str| std::fs::read(format!("{base}{ext}")).map_err(|e| format!("{base}{ext}: {e}"));
         let meta = String::from_utf8(read(".json")?).map_err(|e| e.to_string())?;
         let one = |key: &str| {
@@ -83,7 +88,7 @@ impl Trace {
         };
         let (layers, experts, top_k) = (one("num_layers")?, one("num_experts")?, one("top_k")?);
         let picks = read(".bin")?;
-        let preds = read(".pred.bin").ok();
+        let preds = if pred_dist == 1 { read(".pred.bin").ok() } else { read(&format!(".pred{pred_dist}.bin")).ok() };
         let scores: Option<Vec<u16>> = read(".scores.bin")
             .ok()
             .map(|b| b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect());
@@ -101,18 +106,25 @@ impl Trace {
             .map(|((id, start), tokens)| Sequence { id, start, tokens })
             .collect();
         let total: usize = seqs.iter().map(|s| s.tokens).sum();
+        let pred_width = preds.as_ref().map_or(top_k, |p| p.len() / (total * layers).max(1));
         if picks.len() != total * row
-            || preds.as_ref().is_some_and(|p| p.len() != picks.len())
+            || preds.as_ref().is_some_and(|p| p.len() != total * layers * pred_width || pred_width < top_k)
             || scores.as_ref().is_some_and(|s| s.len() != picks.len())
         {
             return Err(format!("trace size mismatch: {} bytes for {total} tokens", picks.len()));
         }
-        Ok(Self { layers, experts, top_k, picks, preds, scores, seqs })
+        Ok(Self { layers, experts, top_k, picks, preds, pred_width, scores, seqs })
     }
 
     fn row<'a, T>(&self, buf: &'a [T], token: usize, layer: usize) -> &'a [T] {
         let i = (token * self.layers + layer) * self.top_k;
         &buf[i..i + self.top_k]
+    }
+
+    /// The `width` best predictions for (token, layer).
+    fn pred_row<'a>(&self, preds: &'a [u8], token: usize, layer: usize, width: usize) -> &'a [u8] {
+        let i = (token * self.layers + layer) * self.pred_width;
+        &preds[i..i + width.min(self.pred_width)]
     }
 }
 
@@ -456,6 +468,10 @@ pub struct ReplayConfig {
     /// Drop a token's lowest-weight pick when it is not resident (no read).
     pub skip_last_miss: bool,
     pub prefetch: bool,
+    /// Prefetch layer l + `prefetch_dist` while layer l runs.
+    pub prefetch_dist: usize,
+    /// How many of the ranked predictions to prefetch (default: top-k).
+    pub prefetch_width: Option<usize>,
     pub threads: usize,
     pub compute: Duration,
     pub seqs: Option<Vec<usize>>,
@@ -500,7 +516,7 @@ fn high_half(weights: &[u16]) -> Vec<bool> {
 }
 
 pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayConfig) -> Result<(), String> {
-    let tr = Trace::load(trace_base)?;
+    let tr = Trace::load(trace_base, cfg.prefetch_dist)?;
     let (layers, experts, k) = (tr.layers, tr.experts, tr.top_k);
     let total = layers * experts;
     let file_len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
@@ -515,7 +531,7 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
             return Err("--prefetch is only implemented for the single-format LRU cache".into());
         }
         (Some(p), true) => Some(p),
-        (None, true) => return Err("--prefetch needs <trace>.pred.bin".into()),
+        (None, true) => return Err("--prefetch needs <trace>.pred.bin (or .pred<d>.bin for --prefetch-dist d)".into()),
         _ => None,
     };
     if (cfg.tiered || cfg.skip_last_miss) && tr.scores.is_none() {
@@ -528,6 +544,8 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
         .cache_gb
         .map_or(cfg.cache_fraction, |gb| gb * 1e9 / (cfg.target_layers * experts * expert_bytes) as f64);
     let budget = ((fraction * (total * expert_bytes) as f64) as usize).max(3 * k * expert_bytes);
+    let width = cfg.prefetch_width.unwrap_or(k);
+    let dist = cfg.prefetch_dist.max(1);
     let seq_ids: Vec<usize> = cfg.seqs.clone().unwrap_or_else(|| (0..tr.seqs.len()).collect());
 
     let mut cache = Cache::new(cfg.policy, budget, layers, experts, expert_bytes, cfg.low_bytes);
@@ -540,7 +558,13 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
         if cfg.policy == Policy::Lru { "lru" } else { "lfu-decay, per layer" },
         expert_bytes as f64 / (1 << 20) as f64,
         if cfg.tiered { format!(", low copy {:.2} MiB for low-weight picks", cfg.low_bytes as f64 / (1 << 20) as f64) } else { String::new() },
-        if cfg.prefetch { "pre-gate" } else { "off" },
+        if !cfg.prefetch {
+            "off".to_string()
+        } else if dist == 1 {
+            format!("pre-gate, {width} wide")
+        } else {
+            format!("predictor {dist} layers ahead, {width} wide")
+        },
         cfg.threads,
     );
     let resident = data::resident_pct(path).unwrap_or(-1.0);
@@ -647,15 +671,15 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
                     current.push(slot);
                 }
 
-                // 2. Prefetch the next layer's predicted experts while this one runs.
+                // 2. Prefetch layer l + dist's predicted experts while this one runs.
                 if let Some(p) = preds
-                    && l + 1 < layers
+                    && l + dist < layers
                 {
-                    for &e in tr.row(p, t, l + 1) {
+                    for &e in tr.pred_row(p, t, l + dist, width) {
                         if e == NO_PRED {
                             continue;
                         }
-                        let id = (l + 1) * experts + e as usize;
+                        let id = (l + dist) * experts + e as usize;
                         if cache.map[id].is_none()
                             && let Some(slot) = load(&mut cache, &pool, id, false, false, now)?
                         {
@@ -745,7 +769,7 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
         println!("verify      ok ({} experts)", st.accesses);
     }
     println!(
-        "RESULT mode=replay cache_pct={:.1} prefetch={} threads={} compute_us={} tokens={} hit_pct={:.2} gb_per_token={:.3} gbps={:.3} stall_ms_per_token={:.2} ms_per_token={:.2} target_tok_s={target_tok_s:.3} wasted_prefetch={} resident_pct={resident:.2} resident_end_pct={resident_end:.2} policy={} tiered={} low_reads={} bypassed={} buf_gib={buf_gib:.2} skipped={}",
+        "RESULT mode=replay cache_pct={:.1} prefetch={} threads={} compute_us={} tokens={} hit_pct={:.2} gb_per_token={:.3} gbps={:.3} stall_ms_per_token={:.2} ms_per_token={:.2} target_tok_s={target_tok_s:.3} wasted_prefetch={} resident_pct={resident:.2} resident_end_pct={resident_end:.2} policy={} tiered={} low_reads={} bypassed={} buf_gib={buf_gib:.2} skipped={} prefetch_dist={dist} prefetch_width={width}",
         fraction * 100.0,
         cfg.prefetch as u8,
         cfg.threads,

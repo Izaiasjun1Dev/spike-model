@@ -77,6 +77,12 @@ struct ReplayArgs {
     /// Prefetch the next layer's pre-gated prediction while the current layer runs.
     #[arg(long)]
     prefetch: bool,
+    /// Prefetch this many layers ahead; d > 1 reads <trace>.pred<d>.bin.
+    #[arg(long, default_value_t = 1)]
+    prefetch_dist: usize,
+    /// Prefetch the best N predictions per layer (default: top-k).
+    #[arg(long)]
+    prefetch_width: Option<usize>,
     #[arg(long, default_value_t = 8)]
     threads: usize,
     /// Busy-wait per layer after its experts land, standing in for GPU work.
@@ -426,6 +432,8 @@ fn main() -> ExitCode {
                 low_bytes: data::align_up(low) as usize,
                 skip_last_miss: a.skip_last_miss,
                 prefetch: a.prefetch,
+                prefetch_dist: a.prefetch_dist,
+                prefetch_width: a.prefetch_width,
                 threads: a.threads.max(1),
                 compute: Duration::from_micros(a.compute_us),
                 seqs: a.seqs,
