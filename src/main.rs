@@ -162,6 +162,7 @@ enum Preset {
     Qwen3_30bA3b,
     Qwen3_235bA22b,
     DeepseekV3,
+    KimiK2,
 }
 
 impl Preset {
@@ -172,6 +173,8 @@ impl Preset {
             Preset::Qwen3_235bA22b => (4096, 1536, 94, 8),
             // 61 layers, the first 3 are dense.
             Preset::DeepseekV3 => (7168, 2048, 58, 8),
+            // DeepSeek-V3 architecture with 384 experts; only the first layer is dense.
+            Preset::KimiK2 => (7168, 2048, 60, 8),
         }
     }
 }

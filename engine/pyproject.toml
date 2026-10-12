@@ -1,0 +1,8 @@
+[project]
+name = "moe-stream"
+version = "0.1.0"
+description = "Run large MoE models with experts streamed from the SSD"
+requires-python = ">=3.12"
+dependencies = [
+    "mlx-lm>=0.32.0",
+]
