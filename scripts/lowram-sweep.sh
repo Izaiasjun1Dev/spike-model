@@ -16,10 +16,10 @@ out=results/$(date +%Y%m%d-%H%M%S)-lowram.csv
 
 cargo build --release --quiet
 mkdir -p results
-echo "cache_gb,mode,cache_pct,prefetch,threads,compute_us,tokens,hit_pct,gb_per_token,gbps,stall_ms_per_token,ms_per_token,target_tok_s,wasted_prefetch,resident_pct,resident_end_pct,policy,tiered,low_reads,bypassed,buf_gib" > "$out"
+echo "cache_gb,mode,cache_pct,prefetch,threads,compute_us,tokens,hit_pct,gb_per_token,gbps,stall_ms_per_token,ms_per_token,target_tok_s,wasted_prefetch,resident_pct,resident_end_pct,policy,tiered,low_reads,bypassed,buf_gib,skipped" > "$out"
 
 for gb in $budgets; do
-  for mode in "--policy lru" "--policy lfu" "--policy lfu --tiered"; do
+  for mode in "--policy lru" "--policy lfu" "--policy lfu --tiered" "--policy lfu --tiered --skip-last-miss"; do
     line=$("$bin" replay --path "$file" --trace "$trace" --cache-gb "$gb" $mode \
       --seqs "$seqs" --max-tokens "$tokens" --compute-us "$compute_us" 2>/dev/null | grep '^RESULT') || {
       echo "skip: $gb GB $mode failed" >&2

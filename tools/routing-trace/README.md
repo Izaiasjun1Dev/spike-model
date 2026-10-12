@@ -164,3 +164,33 @@ removidos em todos os tokens, sem renormalizar:
 
 Pular o pick 8 só quando ele é miss custa ainda menos e corta ~1/8 das
 leituras de miss. É um bom complemento ao cache em duas resoluções.
+
+### Pular o pick 8 no miss + DWQ na cópia q2
+
+**Pular o pick 8 quando ele é miss** (`tiered.py`, esquema `q4/q2 + skip 8`).
+O pick 8 é o de menor peso do roteador. Se não estiver residente, não é lido
+nem calculado.
+
+| RAM (235B) | q4/q2 por peso | **+ pular o 8** |
+|---|---|---|
+| 8 GB | 3,9 tok/s | **4,3** |
+| 16 GB | 5,8 | **6,5** |
+| 24 GB | 8,5 | **9,7** |
+
+Os valores são o limite do SSD. A qualidade (`quality.py`) passa de ×1,034
+para ×1,041 quando o 8 é pulado em metade dos tokens, que é a taxa típica de
+miss. Pular sempre custa ×1,050.
+
+**DWQ nas cópias q2** (`dwq.py`). O professor é o modelo de 4 bits e só as
+escalas e biases das cópias q2 treinam. A calibração usa 20 mil tokens dos
+prompts de treino e a avaliação usa os prompts de teste.
+
+| q2 nos picks 5–8 | KL | top-1 igual |
+|---|---|---|
+| antes | 0,045 | 92,1% |
+| depois (lr 1e-5, 2 épocas) | 0,065 | 90,7% |
+
+O DWQ piorou. Com 20 mil tokens ele se ajusta demais a esse texto; o DWQ do
+mlx-lm usa ~2 milhões de tokens por padrão (2048 amostras × 1024). Se for
+tentado de novo, deve ser feito direito no packer: é um custo único por modelo,
+com mais dados e, de preferência, o modelo bf16 como professor.

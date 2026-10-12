@@ -15,6 +15,9 @@ since they live in RAM anyway. Variants:
   q3, q2           every expert call at 3 / 2 bits
   q2 rank 5-8      the four lowest-weight picks of each token at 2 bits
   q3/q2 by rank    same, with the four highest-weight picks at 3 bits
+  q2 rank 5-7 + skip 8 [on 50%]  two-resolution cache that also drops the
+                   lowest-weight pick (always, or on half the tokens as a
+                   stand-in for "only when it misses")
   skip rank 8 / 7-8  drop the lowest-weight pick(s) of every token without
                    renormalizing (upper bound on skipping low-weight misses)
   ... hadamard     the low-bit copy quantizes W·H (H a Hadamard rotation of
@@ -65,7 +68,7 @@ class TieredMoE(nn.Module):
             return b(x)
         gates = mx.softmax(b.gate(x), axis=-1, precise=True)
         k = b.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(mx.argpartition(gates, kth=-k, axis=-1)[..., -k:])
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if b.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -79,9 +82,14 @@ class TieredMoE(nn.Module):
         if self.rule == "all":
             y = y_lo
         else:
-            if self.rule == "rank":
+            if self.rule.startswith("rank"):
                 rank = mx.argsort(mx.argsort(-scores, axis=-1), axis=-1)
                 use_lo = rank >= k // 2
+                if self.rule.startswith("rankskip"):
+                    # also drop the lowest-weight pick, always or with prob p
+                    p = float(self.rule[8:] or 1.0)
+                    drop = (rank == k - 1) & (mx.random.uniform(shape=inds.shape) < p)
+                    scores = mx.where(drop, 0.0, scores)
             else:
                 use_lo = mx.random.uniform(shape=inds.shape) < float(self.rule[1:])
             hi = self.hi if self.hi is not None else b.switch_mlp
@@ -110,6 +118,7 @@ def low_bit_copy(sw, bits: int, rotate: bool = False):
     for name in ("gate_proj", "up_proj", "down_proj"):
         src = getattr(sw, name)
         dst = copy.copy(src)
+        dst._no_grad = set(getattr(src, "_no_grad", ()))  # own freeze state, not src's
         w = mx.dequantize(src.weight, src.scales, src.biases,
                           group_size=src.group_size, bits=src.bits)
         if rotate:
@@ -179,7 +188,9 @@ def main():
                 (2, "rank3", "q3/q2 by rank"),
                 (3, "all", "q3 hadamard", True), (2, "all", "q2 hadamard", True),
                 (2, "rank", "q2 hadamard rank 5-8", True),
-                (2, "skip1", "skip rank 8"), (2, "skip2", "skip ranks 7-8")]
+                (2, "skip1", "skip rank 8"), (2, "skip2", "skip ranks 7-8"),
+                (2, "rankskip", "q2 rank 5-7 + skip 8"),
+                (2, "rankskip0.5", "q2 rank 5-7 + skip 8 on 50%")]
     if args.only:
         variants = [v for v in variants if v[2] in args.only.split(",")]
         if args.json.exists():

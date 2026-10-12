@@ -453,6 +453,8 @@ pub struct ReplayConfig {
     /// weight may use (and on a miss, read) the low-precision copy.
     pub tiered: bool,
     pub low_bytes: usize,
+    /// Drop a token's lowest-weight pick when it is not resident (no read).
+    pub skip_last_miss: bool,
     pub prefetch: bool,
     pub threads: usize,
     pub compute: Duration,
@@ -472,11 +474,18 @@ struct Stats {
     prefetch_reads: u64,
     low_reads: u64,
     bypassed: u64,
+    skipped: u64,
     bytes_read: u64,
     promoted: u64,
     stall: Duration,
     stalls: Vec<Duration>,
     tokens: u64,
+}
+
+/// Index of a token's lowest-weight pick (ties: the later one, matching
+/// `high_half`).
+fn lowest(weights: &[u16]) -> usize {
+    (0..weights.len()).rev().min_by_key(|&i| weights[i]).unwrap_or(0)
 }
 
 /// Which of a token's picks are in the top half by router weight. Weights
@@ -509,8 +518,8 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
         (None, true) => return Err("--prefetch needs <trace>.pred.bin".into()),
         _ => None,
     };
-    if cfg.tiered && tr.scores.is_none() {
-        return Err("--tiered needs <trace>.scores.bin".into());
+    if (cfg.tiered || cfg.skip_last_miss) && tr.scores.is_none() {
+        return Err("--tiered and --skip-last-miss need <trace>.scores.bin".into());
     }
     if cfg.low_bytes > expert_bytes {
         return Err("the low-precision copy is larger than the expert".into());
@@ -589,9 +598,9 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
             for l in 0..layers {
                 // 1. Resolve this layer's picks: hit (maybe still in flight) or demand read.
                 let picks = tr.row(&tr.picks, t, l);
-                let high = match &tr.scores {
-                    Some(sc) => high_half(tr.row(sc, t, l)),
-                    None => vec![true; k],
+                let (high, last) = match &tr.scores {
+                    Some(sc) => (high_half(tr.row(sc, t, l)), lowest(tr.row(sc, t, l))),
+                    None => (vec![true; k], k),
                 };
                 if cfg.policy == Policy::Lfu {
                     for (j, &e) in picks.iter().enumerate() {
@@ -618,6 +627,10 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
                                 }
                             }
                             slot
+                        }
+                        _ if cfg.skip_last_miss && j == last => {
+                            st.skipped += 1;
+                            continue;
                         }
                         _ => {
                             st.demand_reads += 1;
@@ -707,8 +720,8 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
 
     println!("tokens      {} ({:.1} s)", st.tokens, elapsed);
     println!(
-        "cache       hit {:.1}% ({} in flight, {} promoted) | {} demand ({} low copies, {} bypassed) + {} prefetch reads ({} wasted)",
-        hit * 100.0, st.hits_in_flight, st.promoted, st.demand_reads, st.low_reads, st.bypassed, st.prefetch_reads, cache.wasted
+        "cache       hit {:.1}% ({} in flight, {} promoted) | {} demand ({} low copies, {} bypassed, {} skipped) + {} prefetch reads ({} wasted)",
+        hit * 100.0, st.hits_in_flight, st.promoted, st.demand_reads, st.low_reads, st.bypassed, st.skipped, st.prefetch_reads, cache.wasted
     );
     println!("memory      budget {:.2} GiB, buffers peak {buf_gib:.2} GiB", budget as f64 / data::GIB);
     println!(
@@ -732,7 +745,7 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
         println!("verify      ok ({} experts)", st.accesses);
     }
     println!(
-        "RESULT mode=replay cache_pct={:.1} prefetch={} threads={} compute_us={} tokens={} hit_pct={:.2} gb_per_token={:.3} gbps={:.3} stall_ms_per_token={:.2} ms_per_token={:.2} target_tok_s={target_tok_s:.3} wasted_prefetch={} resident_pct={resident:.2} resident_end_pct={resident_end:.2} policy={} tiered={} low_reads={} bypassed={} buf_gib={buf_gib:.2}",
+        "RESULT mode=replay cache_pct={:.1} prefetch={} threads={} compute_us={} tokens={} hit_pct={:.2} gb_per_token={:.3} gbps={:.3} stall_ms_per_token={:.2} ms_per_token={:.2} target_tok_s={target_tok_s:.3} wasted_prefetch={} resident_pct={resident:.2} resident_end_pct={resident_end:.2} policy={} tiered={} low_reads={} bypassed={} buf_gib={buf_gib:.2} skipped={}",
         fraction * 100.0,
         cfg.prefetch as u8,
         cfg.threads,
@@ -748,6 +761,7 @@ pub fn replay(path: &Path, trace_base: &str, expert_bytes: usize, cfg: &ReplayCo
         cfg.tiered as u8,
         st.low_reads,
         st.bypassed,
+        st.skipped,
     );
     Ok(())
 }
@@ -807,6 +821,12 @@ mod tests {
         }
         assert!(c.make_room(7, true, 0, &done));
         assert_eq!(c.used[0], c.full_bytes);
+    }
+
+    #[test]
+    fn lowest_pick() {
+        assert_eq!(lowest(&[10, 40, 5, 30]), 2);
+        assert_eq!(lowest(&[5, 5, 5, 5]), 3);
     }
 
     #[test]

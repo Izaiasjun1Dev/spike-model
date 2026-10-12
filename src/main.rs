@@ -68,6 +68,9 @@ struct ReplayArgs {
     /// low-precision copy of the expert.
     #[arg(long)]
     tiered: bool,
+    /// Skip a token's lowest-weight pick when it misses (no read, not computed).
+    #[arg(long)]
+    skip_last_miss: bool,
     /// Bits per weight of the low-precision copy.
     #[arg(long, default_value_t = 2.5)]
     low_bits: f64,
@@ -421,6 +424,7 @@ fn main() -> ExitCode {
                 },
                 tiered: a.tiered,
                 low_bytes: data::align_up(low) as usize,
+                skip_last_miss: a.skip_last_miss,
                 prefetch: a.prefetch,
                 threads: a.threads.max(1),
                 compute: Duration::from_micros(a.compute_us),

@@ -15,7 +15,7 @@ out=results/$(date +%Y%m%d-%H%M%S)-replay.csv
 
 cargo build --release --quiet
 mkdir -p results
-echo "mode,cache_pct,prefetch,threads,compute_us,tokens,hit_pct,gb_per_token,gbps,stall_ms_per_token,ms_per_token,target_tok_s,wasted_prefetch,resident_pct,resident_end_pct,policy,tiered,low_reads,bypassed,buf_gib" > "$out"
+echo "mode,cache_pct,prefetch,threads,compute_us,tokens,hit_pct,gb_per_token,gbps,stall_ms_per_token,ms_per_token,target_tok_s,wasted_prefetch,resident_pct,resident_end_pct,policy,tiered,low_reads,bypassed,buf_gib,skipped" > "$out"
 
 for cache in 20 25 30; do
   for prefetch in "" "--prefetch"; do

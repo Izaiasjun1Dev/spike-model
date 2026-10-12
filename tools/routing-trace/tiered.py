@@ -15,6 +15,8 @@ and bypass, scored per byte: a q4 entry is worth every recent use of the
 expert, a q2 entry only its recent low picks (it can't serve a high one).
 A newcomer evicts only entries worth less per byte than itself.
 
+"+ skip 8" also drops the lowest-weight pick when it misses (no read).
+
 Compared against single-format caches with the same policy (q4 and q3
 everywhere). tok/s is the SSD-only bound on the 235B target.
 
@@ -32,7 +34,9 @@ from sim import TARGET, Trace, split
 BPW = {"q4": 4.5, "q3": 3.5, "q2": 2.5}
 SIZE = {f: b / BPW["q4"] for f, b in BPW.items()}  # in q4-expert units
 # Perplexity vs the 4-bit model, from quality.py (traces/quality.json).
-PPL = {"q4": 1.0, "q3": 1.076, "q4/q2 by rank": 1.034}
+# "+ skip 8" is the upper bound (pick 8 always dropped); skipping it only on
+# a miss costs less.
+PPL = {"q4": 1.0, "q3": 1.076, "q4/q2 by rank": 1.034, "q4/q2 + skip 8": None}
 HALF_LIFE = 32.0
 
 
@@ -90,11 +94,15 @@ def run_layer(picks: np.ndarray, weights: np.ndarray, cap: float, scheme: str):
     """picks, weights: [tokens, K]. Returns (hits, bytes read in q4 units)."""
     c = LayerCache(cap, 0.5 ** (1 / HALF_LIFE))
     K = picks.shape[1]
+    skip_last = scheme == "q4/q2 + skip 8"
+    if skip_last:
+        scheme = "q4/q2 by rank"
     hits = 0
     read = 0.0
     for t in range(picks.shape[0]):
         order = np.argsort(-weights[t])
         high = set(picks[t, order[: K // 2]].tolist())
+        last = int(picks[t, order[-1]])
         row = picks[t].tolist()
         for e in row:
             c.bump(c.hi if e in high else c.lo, e, t)
@@ -108,6 +116,8 @@ def run_layer(picks: np.ndarray, weights: np.ndarray, cap: float, scheme: str):
             if have == need or have == "q4" or (have and need == "q2"):
                 hits += 1
                 continue
+            if skip_last and e == last:
+                continue  # lowest-weight pick missed: skip it, no read
             read += SIZE[need]
             c.admit(e, need, t, protect)
     return hits, read
@@ -122,7 +132,7 @@ def main():
     _, test = split(tr.seqs)
     T = TARGET
     q4_bytes = expert_bytes(BPW["q4"])
-    schemes = ["q4", "q3", "q4/q2 by rank"]
+    schemes = ["q4", "q3", "q4/q2 by rank", "q4/q2 + skip 8"]
     print(f"target {T['name']}: {T['layers']} layers, SSD {T['ssd_gbps']} GB/s, "
           f"tok/s is the SSD-only bound; ppl vs 4-bit model from quality.py")
     print(f"{'RAM GB':>6} " + " ".join(f"{s + ' hit':>17} {'GB/tok':>6} {'tok/s':>5}" for s in schemes))
@@ -148,7 +158,7 @@ def main():
             rows.append({"ram_gb": gb, "scheme": s, "hit": hits / total,
                          "gb_per_token": gb_tok, "target_tok_s": tok_s, "ppl": PPL[s]})
         print(line, flush=True)
-    print("ppl x: " + ", ".join(f"{s} {PPL[s]}" for s in schemes))
+    print("ppl x: " + ", ".join(f"{s} {PPL[s]}" for s in schemes if PPL[s]))
     if args.json:
         with open(args.json, "w") as f:
             json.dump({"trace": args.trace, "target": T, "rows": rows}, f, indent=1)

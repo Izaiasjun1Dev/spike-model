@@ -95,17 +95,19 @@ scripts/lowram-sweep.sh ~/experts96.bin tools/routing-trace/traces/qwen3-30b-a3b
 
 Resultados (mesmas condições acima, tok/s projetado para o 235B):
 
-| RAM p/ experts | LRU | LFU | **LFU + duas resoluções** |
-|---|---|---|---|
-| 8 GB | 2,09 (31,8%) | 2,36 (41,5%) | **2,93** (40,6%) |
-| 16 GB | 3,17 (57,0%) | 3,28 (59,9%) | **4,10** (59,4%) |
-| 24 GB | 4,31 (70,0%) | 4,43 (71,9%) | **5,58** (71,4%) |
+| RAM p/ experts | LRU | LFU | LFU + duas resoluções | **+ `--skip-last-miss`** |
+|---|---|---|---|---|
+| 8 GB | 2,09 (31,8%) | 2,36 (41,5%) | 2,93 (40,6%) | **3,33** |
+| 16 GB | 3,17 (57,0%) | 3,28 (59,9%) | 4,10 (59,4%) | **4,46** |
+| 24 GB | 4,31 (70,0%) | 4,43 (71,9%) | 5,58 (71,4%) | **5,92** |
 
 Entre parênteses está a taxa de acerto. O modo em duas resoluções ganha
 +29–40% sobre o LRU, com perplexidade ×1,034 em relação ao modelo de 4 bits
 (medida pelo `tools/routing-trace/quality.py`). O ganho vem de misses mais
 baratos, não de mais acertos. O LFU ajuda mais quanto menor o cache. As
 listas de buffers livres ficam no máximo 2% acima do orçamento.
+`--skip-last-miss` pula o pick de menor peso quando ele não está residente
+(nem lê, nem calcula). Isso soma +6–14%, e a perplexidade vai a ×1,041.
 
 ## Parâmetros
 
