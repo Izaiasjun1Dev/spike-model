@@ -1,0 +1,15 @@
+[package]
+name = "moe-run"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.190"
+mlx-rs = { version = "0.32", default-features = false, features = ["metal", "accelerate"] }
+serde_json = "1.0.154"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+# Build mlx-c against the prebuilt MLX from the Python wheel (no Xcode/Metal
+# compiler needed); set MLX_SYSTEM_DIR, see vendor/mlx-sys/build.rs.
+[patch.crates-io]
+mlx-sys = { path = "vendor/mlx-sys" }
