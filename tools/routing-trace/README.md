@@ -58,3 +58,42 @@ teste, como domínio nunca visto). Cada sequência de teste começa com cache fr
 - Os misses carregam quase a mesma fração do peso do roteador que dos picks
   (18,8% contra 20,6% com 25%): pular misses de peso < 5% não economiza nada, e
   < 10% descarta 7% do peso (perda de qualidade a medir antes de considerar).
+
+## Pouca RAM: compressão, política de cache e precisão (`budget.py`, `quality.py`)
+
+25% dos experts do 235B são ~30 GB de RAM, mais do que a maioria dos Macs tem.
+
+**Compressão sem perda não resolve.** Nos experts reais de 4 bits, os códigos
+têm entropia de 3,71 bits (de 4). O zstd comprime os pesos 1,07×, e escalas e
+biases 1,6×. O ideal teórico do expert inteiro é 1,12×. Além disso, o zstd
+descomprime a ~1,5 GB/s numa thread, mais devagar que o SSD.
+
+**Com cache pequeno, a política importa** (`uv run budget.py traces/qwen3-30b-a3b`).
+Quando o cache não comporta o conjunto de experts de um token, o LRU global
+fica trocando experts sem parar (0% de acerto com 4–6 GB). Um LFU com
+decaimento, por camada e com bypass (só entra quem tem uso recente maior que
+o de quem sai), mantém um subconjunto estável:
+
+| RAM p/ experts (235B q4) | LRU global | LFU-decay | Belady (limite) |
+|---|---|---|---|
+| 4 GB | 0,0% | 26,6% | 38,7% |
+| 8 GB | 31,1% | 41,6% | 58,8% |
+| 16 GB | 56,6% | 60,4% | 76,1% |
+| 32 GB | 79,5% | 81,4% | 90,0% |
+
+**Menos bits por expert é a compressão de verdade, e o roteador diz onde ela
+pode ser aplicada** (`uv run quality.py`). A referência é o modelo de 4 bits;
+só os experts mudam. São 25 sequências e 10,3 mil tokens.
+
+| experts | KL (nats) | top-1 igual | perplexidade |
+|---|---|---|---|
+| q4 requantizado (piso do método) | 0,008 | 96,3% | ×1,003 |
+| q3 em tudo | 0,138 | 88,4% | ×1,076 |
+| q2 em tudo | 0,405 | 76,8% | ×1,345 |
+| q2 em 25% das chamadas, aleatórias | 0,083 | 89,3% | ×1,046 |
+| q2 em 50% das chamadas, aleatórias | 0,172 | 85,2% | ×1,117 |
+| **q2 só nos picks 5–8 do roteador (50%)** | **0,044** | **91,9%** | **×1,034** |
+
+Pôr em 2 bits os 4 experts de menor peso de cada token custa menos que q3 em
+tudo e menos que q2 em só 25% das chamadas aleatórias. A precisão deve
+seguir o peso do roteador, não ser fixa por expert.
