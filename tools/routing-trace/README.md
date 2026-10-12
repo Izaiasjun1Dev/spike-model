@@ -93,7 +93,30 @@ só os experts mudam. São 25 sequências e 10,3 mil tokens.
 | q2 em 25% das chamadas, aleatórias | 0,083 | 89,3% | ×1,046 |
 | q2 em 50% das chamadas, aleatórias | 0,172 | 85,2% | ×1,117 |
 | **q2 só nos picks 5–8 do roteador (50%)** | **0,044** | **91,9%** | **×1,034** |
+| q3 nos picks 1–4 e q2 nos 5–8 | 0,173 | 86,1% | ×1,112 |
 
 Pôr em 2 bits os 4 experts de menor peso de cada token custa menos que q3 em
 tudo e menos que q2 em só 25% das chamadas aleatórias. A precisão deve
 seguir o peso do roteador, não ser fixa por expert.
+
+### Cache em duas resoluções (`uv run tiered.py traces/qwen3-30b-a3b`)
+
+No disco, cada expert fica em q4 e em q2. Os picks do topo (os 4 de maior peso
+do roteador) precisam de q4; os de baixo usam qualquer cópia residente e, num
+miss, leem a q2, que tem 56% dos bytes. A RAM é um orçamento em bytes por
+camada, com LFU com decaimento e bypass, e o score é medido por byte. Uma
+cópia q2 só vale pelos usos de baixo peso.
+
+| RAM (235B) | q4: tok/s | q3: tok/s | **q4/q2 por peso: tok/s** |
+|---|---|---|---|
+| 8 GB | 3,0 | 4,3 | **3,9** |
+| 16 GB | 4,4 | 6,9 | **5,8** |
+| 24 GB | 6,5 | 11,0 | **8,5** |
+| 32 GB | 9,4 | 18,6 | **12,5** |
+| perplexidade | ×1,000 | ×1,076 | **×1,034** |
+
+Os valores de tok/s são o limite do SSD. O replay real fica em ~70% disso. O
+ganho do esquema vem de misses mais baratos, não de mais acertos: a taxa de
+acerto é a mesma do q4. Ele fica no meio da fronteira qualidade × velocidade.
+q3 em tudo é mais rápido, mas perde o dobro de qualidade. Misturar q3 e q2 é
+pior que q3 sozinho.

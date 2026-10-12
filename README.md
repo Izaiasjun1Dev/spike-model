@@ -78,6 +78,35 @@ ajuda: o compute por camada (~0,27 ms) é menor que uma leitura de expert
 (~0,8 ms), e as previsões erradas gastam +27% de leitura. Com só 1–2 misses
 por camada, o SSD fica em 8–12 GB/s: o gargalo passa a ser latência.
 
+### Pouca RAM: LFU e experts em duas resoluções
+
+`--cache-gb N` define o orçamento em GB no modelo-alvo. `--policy lfu` usa
+LFU com decaimento por camada e bypass: um expert novo só entra se valer mais
+por byte do que os que sairiam; senão é lido só para aquela camada.
+`--tiered` faz a metade de menor peso dos picks de cada token usar uma cópia
+de baixa precisão (`--low-bits 2.5`). Num miss, só essa cópia é lida (os
+primeiros 56% do expert no arquivo de teste), e ela também pode ocupar o
+cache. A metade de maior peso sempre precisa da cópia completa. Os detalhes
+estão em `tools/routing-trace/tiered.py`, a versão simulada.
+
+```bash
+scripts/lowram-sweep.sh ~/experts96.bin tools/routing-trace/traces/qwen3-30b-a3b   # 8/16/24 GB
+```
+
+Resultados (mesmas condições acima, tok/s projetado para o 235B):
+
+| RAM p/ experts | LRU | LFU | **LFU + duas resoluções** |
+|---|---|---|---|
+| 8 GB | 2,09 (31,8%) | 2,36 (41,5%) | **2,93** (40,6%) |
+| 16 GB | 3,17 (57,0%) | 3,28 (59,9%) | **4,10** (59,4%) |
+| 24 GB | 4,31 (70,0%) | 4,43 (71,9%) | **5,58** (71,4%) |
+
+Entre parênteses está a taxa de acerto. O modo em duas resoluções ganha
++29–40% sobre o LRU, com perplexidade ×1,034 em relação ao modelo de 4 bits
+(medida pelo `tools/routing-trace/quality.py`). O ganho vem de misses mais
+baratos, não de mais acertos. O LFU ajuda mais quanto menor o cache. As
+listas de buffers livres ficam no máximo 2% acima do orçamento.
+
 ## Parâmetros
 
 - `--preset qwen3-30b-a3b | qwen3-235b-a22b | deepseek-v3`: camadas MoE, top-k e

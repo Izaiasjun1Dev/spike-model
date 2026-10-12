@@ -37,7 +37,7 @@ enum Cmd {
     },
     /// Run the simulated decode loop against a file written by `gen`.
     Run(RunArgs),
-    /// Replay a real routing trace through an LRU expert cache with real reads.
+    /// Replay a real routing trace through an expert cache with real reads.
     Replay(ReplayArgs),
 }
 
@@ -59,6 +59,18 @@ struct ReplayArgs {
     /// Cache size as a percentage of all experts in the trace.
     #[arg(long, default_value_t = 25.0)]
     cache_pct: f64,
+    /// Cache size in GB on the target model (overrides --cache-pct).
+    #[arg(long)]
+    cache_gb: Option<f64>,
+    #[arg(long, value_enum, default_value = "lru")]
+    policy: CachePolicy,
+    /// Serve the bottom half of each token's picks (by router weight) from a
+    /// low-precision copy of the expert.
+    #[arg(long)]
+    tiered: bool,
+    /// Bits per weight of the low-precision copy.
+    #[arg(long, default_value_t = 2.5)]
+    low_bits: f64,
     /// Prefetch the next layer's pre-gated prediction while the current layer runs.
     #[arg(long)]
     prefetch: bool,
@@ -81,6 +93,12 @@ struct ReplayArgs {
     /// MoE layer count used for the tok/s projection.
     #[arg(long)]
     target_layers: Option<usize>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CachePolicy {
+    Lru,
+    Lfu,
 }
 
 #[derive(Parser)]
@@ -393,8 +411,16 @@ fn main() -> ExitCode {
                 .expert_mb
                 .map(|mb| (mb * 1024.0 * 1024.0) as u64)
                 .unwrap_or_else(|| preset_expert_bytes(a.preset, a.bits));
+            let low = (bytes as f64 * a.low_bits / a.bits) as u64;
             let cfg = replay::ReplayConfig {
                 cache_fraction: a.cache_pct / 100.0,
+                cache_gb: a.cache_gb,
+                policy: match a.policy {
+                    CachePolicy::Lru => replay::Policy::Lru,
+                    CachePolicy::Lfu => replay::Policy::Lfu,
+                },
+                tiered: a.tiered,
+                low_bytes: data::align_up(low) as usize,
                 prefetch: a.prefetch,
                 threads: a.threads.max(1),
                 compute: Duration::from_micros(a.compute_us),
