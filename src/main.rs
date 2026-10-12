@@ -8,6 +8,7 @@ mod backend;
 mod data;
 #[cfg(target_os = "macos")]
 mod metal_io;
+mod replay;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,6 +37,50 @@ enum Cmd {
     },
     /// Run the simulated decode loop against a file written by `gen`.
     Run(RunArgs),
+    /// Replay a real routing trace through an LRU expert cache with real reads.
+    Replay(ReplayArgs),
+}
+
+#[derive(Parser)]
+struct ReplayArgs {
+    #[arg(long)]
+    path: PathBuf,
+    /// Trace base path written by tools/routing-trace/capture.py (no extension).
+    #[arg(long)]
+    trace: String,
+    /// Expert size comes from this model (the trace may come from a smaller proxy).
+    #[arg(long, value_enum, default_value = "qwen3-235b-a22b")]
+    preset: Preset,
+    #[arg(long, default_value_t = 4.5)]
+    bits: f64,
+    /// Expert size in MiB (overrides the preset).
+    #[arg(long)]
+    expert_mb: Option<f64>,
+    /// Cache size as a percentage of all experts in the trace.
+    #[arg(long, default_value_t = 25.0)]
+    cache_pct: f64,
+    /// Prefetch the next layer's pre-gated prediction while the current layer runs.
+    #[arg(long)]
+    prefetch: bool,
+    #[arg(long, default_value_t = 8)]
+    threads: usize,
+    /// Busy-wait per layer after its experts land, standing in for GPU work.
+    #[arg(long, default_value_t = 0)]
+    compute_us: u64,
+    /// Comma-separated sequence indices to replay (default: all).
+    #[arg(long, value_delimiter = ',')]
+    seqs: Option<Vec<usize>>,
+    /// Replay at most this many tokens per sequence.
+    #[arg(long)]
+    max_tokens: Option<usize>,
+    /// Keep the cache between sequences instead of starting each one cold.
+    #[arg(long)]
+    warm: bool,
+    #[arg(long)]
+    verify: bool,
+    /// MoE layer count used for the tok/s projection.
+    #[arg(long)]
+    target_layers: Option<usize>,
 }
 
 #[derive(Parser)]
@@ -102,6 +147,12 @@ impl Preset {
             Preset::DeepseekV3 => (7168, 2048, 58, 8),
         }
     }
+}
+
+/// Expert bytes (gate + up + down) for a preset at `bits` per weight.
+fn preset_expert_bytes(p: Preset, bits: f64) -> u64 {
+    let (hidden, inter, _, _) = p.dims();
+    (3.0 * hidden as f64 * inter as f64 * bits / 8.0).ceil() as u64
 }
 
 struct Shape {
@@ -337,6 +388,24 @@ fn main() -> ExitCode {
             data::generate(&path, (size_gb * GIB) as u64).map_err(|e| e.to_string())
         }
         Cmd::Run(args) => run(args),
+        Cmd::Replay(a) => {
+            let bytes = a
+                .expert_mb
+                .map(|mb| (mb * 1024.0 * 1024.0) as u64)
+                .unwrap_or_else(|| preset_expert_bytes(a.preset, a.bits));
+            let cfg = replay::ReplayConfig {
+                cache_fraction: a.cache_pct / 100.0,
+                prefetch: a.prefetch,
+                threads: a.threads.max(1),
+                compute: Duration::from_micros(a.compute_us),
+                seqs: a.seqs,
+                max_tokens: a.max_tokens,
+                warm: a.warm,
+                verify: a.verify,
+                target_layers: a.target_layers.unwrap_or(a.preset.dims().2),
+            };
+            replay::replay(&a.path, &a.trace, data::align_up(bytes) as usize, &cfg)
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -44,6 +44,40 @@ Cada `run` imprime no stderr a fração do arquivo que está no page cache
 `RESULT` como `resident_pct` e `resident_end_pct`. Se `resident_pct` não for ~0,
 o número de GB/s não é só SSD.
 
+## Replay de traces reais
+
+`expert-bench replay` usa o roteamento gravado por `tools/routing-trace` para
+fazer leituras reais do SSD através de um cache LRU de experts em RAM, com
+prefetch opcional pela predição de pre-gating. O tamanho do expert vem do
+`--preset` (padrão: 235B), mesmo que o trace venha de um modelo menor.
+
+```bash
+target/release/expert-bench replay --path ~/experts96.bin \
+  --trace tools/routing-trace/traces/qwen3-30b-a3b --cache-pct 25 \
+  --compute-us 270 --max-tokens 200 [--prefetch] [--verify]
+
+# 20/25/30% de cache, com e sem prefetch, nas sequências de teste do simulador
+scripts/replay-sweep.sh ~/experts96.bin tools/routing-trace/traces/qwen3-30b-a3b
+```
+
+O arquivo de teste precisa de `camadas × experts × tamanho do expert` bytes
+(~61 GiB para o trace do 30B com experts do 235B). Leituras pendentes de
+prefetch são promovidas para a fila de demanda quando a camada precisa delas.
+
+Primeira rodada (M5 Max, 11 sequências de teste × 200 tokens, compute 270 µs
+por camada, tok/s projetado para as 94 camadas do 235B):
+
+| cache | ≈ GiB no 235B | acerto | sem prefetch | com prefetch |
+|---|---|---|---|---|
+| 20% | 24 | 72,1% | 4,7 tok/s | 4,5 tok/s |
+| 25% | 30 | 79,8% | 6,1 tok/s | 5,6 tok/s |
+| 30% | 36 | 84,7% | 6,7 tok/s | 7,1 tok/s |
+
+O acerto real bate com o `sim.py` (< 1 ponto). O prefetch de 1 camada quase não
+ajuda: o compute por camada (~0,27 ms) é menor que uma leitura de expert
+(~0,8 ms), e as previsões erradas gastam +27% de leitura. Com só 1–2 misses
+por camada, o SSD fica em 8–12 GB/s: o gargalo passa a ser latência.
+
 ## Parâmetros
 
 - `--preset qwen3-30b-a3b | qwen3-235b-a22b | deepseek-v3`: camadas MoE, top-k e
