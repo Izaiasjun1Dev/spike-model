@@ -109,6 +109,75 @@ listas de buffers livres ficam no máximo 2% acima do orçamento.
 `--skip-last-miss` pula o pick de menor peso quando ele não está residente
 (nem lê, nem calcula). Isso soma +6–14%, e a perplexidade vai a ×1,041.
 
+### Prefetch 2–3 camadas à frente (preditor treinado)
+
+`tools/routing-trace/predictor.py` treina, para cada distância d, um preditor
+dos experts da camada l+d a partir do estado oculto da camada l. No teste
+(decode, top-8), o acerto foi de 79,6% para 83,8% em d=2 e de 75,3% para 80,7%
+em d=3, comparado ao pre-gating. Com os 12 melhores palpites, chega a 94,4% e
+92,0%. O `replay` lê essas predições com `--prefetch-dist d` e
+`--prefetch-width m`.
+
+```bash
+scripts/prefetch-sweep.sh ~/experts96.bin tools/routing-trace/traces/qwen3-30b-a3b-h 20,25
+```
+
+Resultados (cache LRU, mesmas condições acima, tok/s projetado para o 235B; a
+rodada parou antes de d=3 com 25%):
+
+| cache | prefetch | acerto | GB/token | tok/s |
+|---|---|---|---|---|
+| 20% | sem | 72,1% | 1,14 | **4,67** |
+| 20% | pre-gate d=1 | 93,5% | 1,41 | 4,31 |
+| 20% | preditor d=2, largura 8 | 92,5% | 1,41 | 4,41 |
+| 20% | preditor d=2, largura 12 | 95,5% | 2,21 | 2,91 |
+| 20% | preditor d=3, largura 8 | 90,8% | 1,45 | 4,26 |
+| 20% | preditor d=3, largura 12 | 93,7% | 2,23 | 2,95 |
+| 25% | sem | 79,8% | 0,82 | **6,03** |
+| 25% | pre-gate d=1 | 95,0% | 1,05 | 5,76 |
+| 25% | preditor d=2, largura 8 | 94,2% | 1,04 | 5,73 |
+| 25% | preditor d=2, largura 12 | 96,4% | 1,71 | 3,94 |
+
+Nenhum prefetch supera a rodada sem prefetch. O acerto sobe de 72% para 93%,
+mas os palpites errados e os experts úteis que saem do cache aumentam a
+leitura em 23–27% (largura 8) ou em 95–108% (largura 12). Com o SSD já a
+10–13 GB/s, esse tráfego extra custa mais do que a latência que o prefetch
+esconde. O preditor treinado é um pouco melhor que o pre-gating, mas não muda
+a conclusão: com pouca RAM, só rende o que reduz os bytes lidos por token.
+
+### Roteamento ciente de cache
+
+`tools/routing-trace/cacheaware.py` faz o roteador preferir experts
+residentes (`bias<d>` soma d ao log-prob deles; `swap<m>` troca os m picks de
+menor peso) e grava as escolhas como trace. O replay usa esses traces nas
+mesmas 11 sequências e 200 tokens de antes. Os traces incluem o prompt lido
+token a token, então a base de comparação é o `ref` desta tabela, não as
+tabelas acima. A qualidade está em `tools/routing-trace/README.md`.
+
+| regra | ppl | 8 GB, LFU | 8 GB, LFU + duas resoluções + skip | 16 GB, LFU | 16 GB, LFU + duas resoluções + skip |
+|---|---|---|---|---|---|
+| ref | ×1,00 | 2,39 (43,0%) | 3,33 | 3,36 (61,4%) | 4,51 |
+| swap1 | ×1,004–1,010 | 2,73 (49,8%) | 3,24 | 3,75 (66,5%) | 4,54 |
+| swap2 | ×1,014–1,027 | 3,04 (56,1%) | 3,49 | 4,25 (71,3%) | 4,81 |
+| bias0.5 | ×1,016–1,022 | 2,84 (54,0%) | 3,50 | 4,70 (73,5%) | 5,30 |
+| bias1 | ×1,046–1,057 | 3,45 (62,9%) | 3,81 | **6,38** (82,0%) | 6,62 |
+
+Os valores são tok/s projetados para o 235B, com o acerto entre parênteses. A
+coluna ppl é sem duas resoluções (8 GB–16 GB). Com duas resoluções, os custos
+quase se somam: o bias1 vai a ×1,076–1,088.
+
+Com 16 GB, o roteamento ciente de cache substitui as duas resoluções. O
+`bias0.5` só com LFU faz 4,70 tok/s com ×1,022, mais rápido e melhor que o
+q4/q2 + skip (4,51 tok/s, ≈ ×1,04). O `bias1` faz 6,38 tok/s (+41%) com ×1,057.
+Somar o q2 ao bias1 dá só +4%, por muita perda. O `swap1` não soma nada ao
+skip, porque os dois atacam o mesmo pick de menor peso. Com 8 GB, as opções
+ficam próximas (3,3–3,8 tok/s por ×1,04–1,08), porque o cache pequeno oferece
+poucas alternativas boas.
+
+Nas colunas com duas resoluções, as escolhas vieram do loop sem q2. O acerto
+dos traces `-tiered` é quase igual (82,9% contra 82,7% no bias1 de 16 GB),
+mas essas colunas não foram medidas com eles.
+
 ## Parâmetros
 
 - `--preset qwen3-30b-a3b | qwen3-235b-a22b | deepseek-v3`: camadas MoE, top-k e

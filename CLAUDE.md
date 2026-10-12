@@ -33,6 +33,7 @@ target/release/expert-bench replay --path ~/experts96.bin --trace tools/routing-
 scripts/sweep.sh <arquivo> [preset] [tokens]        # run: método × lookahead × compute → results/*.csv
 scripts/replay-sweep.sh <arquivo> <trace-base>      # replay com 20/25/30% de cache, com e sem prefetch
 scripts/lowram-sweep.sh <arquivo> <trace-base>      # replay com 8/16/24 GB, LRU/LFU/duas resoluções/+skip
+scripts/prefetch-sweep.sh <arquivo> <trace-base> [20,25]  # replay: sem prefetch, pre-gate d=1, preditor d=2/3, largura 8/12
 
 cd tools/routing-trace
 uv run capture.py --out traces/qwen3-30b-a3b        # baixa ~17 GB do modelo na 1ª vez
@@ -42,6 +43,9 @@ uv run tiered.py traces/qwen3-30b-a3b               # cache em duas resoluções
 uv run quality.py [--only <variantes>]              # qualidade de experts em baixa precisão
 uv run basis.py                                     # base compartilhada entre experts
 uv run dwq.py                                       # DWQ nas cópias q2 (treina escalas/biases)
+uv run capture.py --out traces/qwen3-30b-a3b-h --hidden --hidden-stride 2   # + estados ocultos (~5,7 GB)
+uv run predictor.py traces/qwen3-30b-a3b-h --dists 1,2,3 --json traces/predictor.json
+uv run cacheaware.py [--budgets 8,16] [--rules ref,bias1,swap2] [--tiered] [--limit n]
 ```
 
 Os scripts de sweep pedem `sudo` uma vez e rodam `sudo purge` antes de cada
@@ -81,6 +85,14 @@ pula o pick de menor peso quando ele não está residente. `replay.rs` espelha
 - `<base>.pred.bin`: a predição de pre-gating da camada, feita na camada
   anterior (255 = sem predição).
 - `<base>.scores.bin`: o peso do roteador de cada pick, em bits f16.
+- `<base>.pred<d>.bin` (do `predictor.py`): `uint8 [tokens, camadas, 16]`, os
+  16 melhores palpites do preditor treinado para a camada, feitos d camadas
+  antes. O `replay` lê com `--prefetch --prefetch-dist d [--prefetch-width m]`
+  (d = 1 continua lendo o `.pred.bin` do pre-gating).
+- `<base>.hidden.bin` / `.hpicks.bin` (do `capture.py --hidden`): entrada do
+  roteador de cada camada (f16 `[linhas, camadas, 2048]`) e os picks dessas
+  linhas; por sequência, as linhas de prefill amostradas vêm antes das de
+  decode (`hidden_start`/`hidden_prefill`/`hidden_decode` no JSON).
 - `<base>.json`: as dimensões do modelo e, para cada sequência, id, categoria,
   início e número de tokens. `replay.rs` lê esse JSON com um scan de chaves e
   não usa crate de JSON; mantenha o formato simples.
@@ -91,7 +103,8 @@ versionados.
 **Python**: `sim.py` define `Trace`, `split` (metade dos prompts para treino e
 metade para teste, com categorias de um só prompt sempre no teste) e `TARGET`
 (as dimensões do 235B e 14 GB/s de SSD, usados nas projeções de tok/s).
-`budget.py` e `tiered.py` importam de `sim`; `tiered.py` importa de `budget`.
+`budget.py`, `tiered.py` e `predictor.py` importam de `sim`; `tiered.py` importa
+de `budget`; `cacheaware.py` importa de `quality`.
 Rode os scripts de dentro de `tools/routing-trace`, porque os imports são
 locais.
 
@@ -103,6 +116,22 @@ e `quality.py` usam o mesmo wrapper. Duas armadilhas já corrigidas: `copy.copy`
 de um módulo MLX compartilha o `_no_grad` (descongelar a cópia descongelaria o
 original), e os índices do roteador precisam de `stop_gradient` para treinar.
 
+**`predictor.py`**: para cada distância d, um mapa linear por camada de
+`h_l` para os experts de l+d, que é o roteador de l+d (congelado) mais uma
+correção treinada (`dw`, `b`). A perda é destilação: o alvo é a distribuição
+completa do roteador de l+d aplicado a `h_{l+d}`. Não use entropia cruzada
+contra o conjunto top-k: ela piora o acerto até no treino, porque é dominada
+pelos picks imprevisíveis e os empurra para o top-k de todo mundo.
+
+**`cacheaware.py`**: roteamento que prefere experts residentes, medido em loop
+fechado (o roteamento muda o cache e o cache muda o roteamento). O texto entra
+token a token com KV cache; cada camada tem um cache LFU com decaimento, em
+arrays MLX. A regra é `keep` (os top picks originais que nunca mudam) mais
+`bias` (somado ao log-prob dos residentes ao escolher o resto). Os pesos de
+mistura continuam os do roteador. Cada variante grava o trace das escolhas em
+`traces/cacheaware/`, para o `tiered.py`/`replay` medirem a velocidade da
+mesma rodada.
+
 ## O que já foi testado
 
 Os números estão nos READMEs. Leia antes de repetir algo.
@@ -113,6 +142,16 @@ picks 1–4, q2 nos 5–8) e pular o pick 8 quando é miss. No replay real, o to
 no 235B foi de 2,09→3,33 (8 GB), 3,17→4,46 (16 GB) e 4,31→5,92 (24 GB), com
 perplexidade ×1,041.
 
+Também funcionou: roteamento ciente de cache (`cacheaware.py`, sem treino). O
+`bias<d>` soma d ao log-prob dos experts residentes. Com 16 GB, ele substitui
+as duas resoluções: `bias0.5` só com LFU faz 4,70 tok/s com ×1,022 (o q4/q2 +
+skip faz 4,51 com ≈ ×1,04), e `bias1` faz 6,38 com ×1,057. Somado ao q2, os
+custos de qualidade quase se somam (bias1 + q2 = ×1,088) e o ganho é só +4%.
+Com 8 GB, as opções ficam próximas (3,3–3,8 tok/s). O `swap<m>` (trocar os m
+picks de menor peso) rende menos que o `bias` e não soma nada ao skip. As
+escolhas no replay vieram dos traces de `traces/cacheaware/`, e a base é o
+`ref` deles, não as tabelas antigas.
+
 Não funcionou (não repita do mesmo jeito):
 - compressão sem perda dos experts de 4 bits (zstd 1,07×, ideal 1,12×);
 - q2 ou q3 em tudo, q2 em chamadas aleatórias, ou q3 + q2 por peso;
@@ -121,12 +160,17 @@ Não funcionou (não repita do mesmo jeito):
   do Qwen3 não compartilham subespaço;
 - DWQ com ~20 mil tokens de calibração: overfit e KL pior (precisa de ~2M);
 - fixar experts populares, agrupar experts co-ativados no disco, aquecer o
-  cache com o prefill, prefetch de 1 camada.
+  cache com o prefill, prefetch de 1 camada;
+- prefetch 2–3 camadas à frente com o preditor treinado (`predictor.py`,
+  acerto 83,8% em d=2): o acerto do cache sobe, mas lê 23–108% a mais e o
+  tok/s cai (4,67→4,41 com 20% de cache). Com pouca RAM, só rende o que
+  reduz os bytes lidos por token.
 
-Próximas ideias, ainda não testadas: roteamento ciente de cache (Qualcomm,
-arXiv 2412.00099; precisa recapturar o trace com os top-16 do roteador),
-layout Matryoshka (o q2 como prefixo do q4), ajuste fino só do roteador e
-kernel Metal real concorrendo com o I/O.
+Próximo passo: ajuste fino só do roteador para chegar ao acerto do `bias1`
+(~83% com 16 GB) com perda perto de ×1,02, o que daria ~6,4 tok/s com
+qualidade melhor que a do design atual. É o candidato a treino em escala (com
+muitos tokens; talvez na AWS). Outras ideias ainda não testadas: layout
+Matryoshka (o q2 como prefixo do q4) e kernel Metal real concorrendo com o I/O.
 
 ## Convenções
 

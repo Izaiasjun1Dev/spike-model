@@ -1,0 +1,161 @@
+{
+ "model": "mlx-community/Qwen3-30B-A3B-4bit",
+ "num_layers": 48,
+ "num_experts": 128,
+ "top_k": 8,
+ "dtype": "uint8",
+ "layout": "token,layer,k (k sorted by descending router score)",
+ "tokens": 10271,
+ "sequences": [
+  {
+   "id": "code-rust-lru",
+   "category": "code",
+   "start": 0,
+   "decode_tokens": 201
+  },
+  {
+   "id": "code-python-parser",
+   "category": "code",
+   "start": 201,
+   "decode_tokens": 207
+  },
+  {
+   "id": "code-explain-backend",
+   "category": "code-long-context",
+   "start": 408,
+   "decode_tokens": 767
+  },
+  {
+   "id": "code-review-main",
+   "category": "code-long-context",
+   "start": 1175,
+   "decode_tokens": 767
+  },
+  {
+   "id": "code-sql",
+   "category": "code",
+   "start": 1942,
+   "decode_tokens": 209
+  },
+  {
+   "id": "chat-pt-viagem",
+   "category": "chat-pt",
+   "start": 2151,
+   "decode_tokens": 223
+  },
+  {
+   "id": "chat-pt-carreira",
+   "category": "chat-pt",
+   "start": 2374,
+   "decode_tokens": 217
+  },
+  {
+   "id": "chat-en-advice",
+   "category": "chat-en",
+   "start": 2591,
+   "decode_tokens": 200
+  },
+  {
+   "id": "math-probability",
+   "category": "math",
+   "start": 2791,
+   "decode_tokens": 209
+  },
+  {
+   "id": "math-proof",
+   "category": "math",
+   "start": 3000,
+   "decode_tokens": 190
+  },
+  {
+   "id": "reasoning-ssd",
+   "category": "reasoning",
+   "start": 3190,
+   "decode_tokens": 231
+  },
+  {
+   "id": "writing-story",
+   "category": "writing",
+   "start": 3421,
+   "decode_tokens": 201
+  },
+  {
+   "id": "translate-pt-en",
+   "category": "translation",
+   "start": 3622,
+   "decode_tokens": 767
+  },
+  {
+   "id": "summarize-readme",
+   "category": "summarization",
+   "start": 4389,
+   "decode_tokens": 767
+  },
+  {
+   "id": "json-extract",
+   "category": "structured",
+   "start": 5156,
+   "decode_tokens": 217
+  },
+  {
+   "id": "reasoning-scheduling",
+   "category": "reasoning",
+   "start": 5373,
+   "decode_tokens": 247
+  },
+  {
+   "id": "writing-poem-pt",
+   "category": "writing",
+   "start": 5620,
+   "decode_tokens": 214
+  },
+  {
+   "id": "translate-en-pt",
+   "category": "translation",
+   "start": 5834,
+   "decode_tokens": 767
+  },
+  {
+   "id": "summarize-data-rs",
+   "category": "summarization",
+   "start": 6601,
+   "decode_tokens": 767
+  },
+  {
+   "id": "json-api",
+   "category": "structured",
+   "start": 7368,
+   "decode_tokens": 202
+  },
+  {
+   "id": "chat-zh-2",
+   "category": "chat-zh",
+   "start": 7570,
+   "decode_tokens": 198
+  },
+  {
+   "id": "chat-zh",
+   "category": "chat-zh",
+   "start": 7768,
+   "decode_tokens": 202
+  },
+  {
+   "id": "README.md",
+   "category": "human",
+   "start": 7970,
+   "decode_tokens": 767
+  },
+  {
+   "id": "tools/routing-trace/README.md",
+   "category": "human",
+   "start": 8737,
+   "decode_tokens": 767
+  },
+  {
+   "id": "src/replay.rs",
+   "category": "human",
+   "start": 9504,
+   "decode_tokens": 767
+  }
+ ]
+}

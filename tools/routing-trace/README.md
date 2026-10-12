@@ -194,3 +194,51 @@ O DWQ piorou. Com 20 mil tokens ele se ajusta demais a esse texto; o DWQ do
 mlx-lm usa ~2 milhões de tokens por padrão (2048 amostras × 1024). Se for
 tentado de novo, deve ser feito direito no packer: é um custo único por modelo,
 com mais dados e, de preferência, o modelo bf16 como professor.
+
+### Roteamento ciente de cache (`cacheaware.py`)
+
+O roteador passa a preferir experts que já estão em RAM, sem treino, na linha
+de Skliar et al. 2024 (arXiv 2412.00099). Como o roteamento muda o cache e o
+cache muda o roteamento, a medida é feita em loop fechado. O texto entra token
+a token com KV cache, e cada camada tem seu próprio cache LFU com decaimento e
+bypass, com o número de slots do orçamento no 235B. Os pesos de mistura são as
+probabilidades do roteador, renormalizadas sobre os experts escolhidos.
+
+- `bias<d>`: soma d ao log-prob dos experts residentes antes de escolher os 8.
+- `swap<m>`: mantém os 8−m melhores picks originais e troca os m de menor peso
+  pelos melhores residentes.
+
+Cada variante grava seu trace em `traces/cacheaware/`, para o `replay` medir a
+velocidade do mesmo roteamento. Os resultados abaixo usam 25 sequências e
+10.271 tokens, comparados ao modelo de 4 bits.
+
+| regra | acerto 8 GB | ppl 8 GB | acerto 16 GB | ppl 16 GB | top-1 igual (16 GB) |
+|---|---|---|---|---|---|
+| ref (roteador original) | 43,1% | ×0,998 | 61,5% | ×0,998 | 96,8% |
+| swap1 | 50,0% | ×1,010 | 66,7% | ×1,004 | 95,3% |
+| swap2 | 56,6% | ×1,027 | 71,5% | ×1,014 | 93,9% |
+| swap4 | 68,8% | ×1,091 | 80,6% | ×1,050 | 90,0% |
+| bias0.5 | 54,6% | ×1,016 | 74,0% | ×1,022 | 93,0% |
+| bias1 | 64,0% | ×1,046 | 82,7% | ×1,057 | 89,5% |
+| bias2 | 77,4% | ×1,227 | 94,1% | ×1,493 | 74,3% |
+
+Com `--tiered`, a cópia q2 serve os picks 5–8:
+
+| regra | ppl 8 GB | ppl 16 GB |
+|---|---|---|
+| ref | ×1,036 | ×1,036 |
+| swap1 | ×1,046 | ×1,039 |
+| swap2 | ×1,059 | ×1,048 |
+| swap4 | ×1,117 | ×1,075 |
+| bias0.5 | ×1,052 | ×1,053 |
+| bias1 | ×1,076 | ×1,088 |
+
+Os custos de qualidade quase se somam: q2 (×1,036) com bias1 (×1,05) dá
+×1,08. O `bias` rende mais acerto por unidade de perda do que o `swap`, porque
+pode trocar qualquer pick, não só os de peso baixo. O tok/s medido no replay
+está no README da raiz. Com 16 GB, `bias0.5` sem q2 já é mais rápido e melhor
+que o design q4/q2 + skip.
+
+Uma armadilha: guardar os picks de cada token como arrays MLX pendentes prende
+dois buffers Metal por camada, e a rodada morre com `Resource limit (499000)`
+depois de ~5 mil tokens. Os picks passam para numpy ao fim de cada sequência.
