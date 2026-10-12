@@ -120,3 +120,47 @@ ganho do esquema vem de misses mais baratos, não de mais acertos: a taxa de
 acerto é a mesma do q4. Ele fica no meio da fronteira qualidade × velocidade.
 q3 em tudo é mais rápido, mas perde o dobro de qualidade. Misturar q3 e q2 é
 pior que q3 sozinho.
+
+## Pesquisa: ideias da literatura testadas no Qwen3 real
+
+**E1: rotação de Hadamard antes de quantizar** (estilo QuIP#). Usei
+`quality.py`, com a variante `hadamard` na cópia de baixa precisão.
+
+| | sem rotação | com Hadamard |
+|---|---|---|
+| q3 em tudo | ×1,076 | ×1,109 |
+| q2 em tudo | ×1,345 | ×1,610 |
+| q2 nos picks 5–8 | ×1,034 | ×1,033 |
+
+A rotação piora. A quantização afim do MLX com grupos de 64 já absorve os
+outliers localmente. O ganho do QuIP# vem de codebooks de lattice e de
+arredondamento guiado pela Hessiana, não só da rotação. Ressalva: os pesos de
+partida já são q4. Partindo do bf16, o resultado pode ser outro.
+
+**E2: base compartilhada entre experts** (estilo D2-MoE / MoBE). Usei
+`basis.py`, com 5 camadas e as projeções gate, up e down. A tabela mostra a
+energia dos pesos capturada com posto r:
+
+| gate/up, camada típica | r = 256 (12,5%) | r = 512 (25%) |
+|---|---|---|
+| base única da camada | 21–24% | 35–39% |
+| base própria de cada expert | 62–67% | 89–91% |
+| matriz aleatória do mesmo formato | 58% | 87,5% |
+
+Os experts do Qwen3 são quase de posto cheio, perto de uma matriz aleatória, e
+não compartilham subespaço. Uma base comum captura menos que uma matriz
+aleatória do mesmo posto. Subtrair o expert médio só remove ~1% da energia.
+Para este modelo (128 experts pequenos), base comum na RAM + delta no SSD não
+funciona. A medida é de energia pura, sem ponderar pelas ativações; uma SVD
+ponderada pelas ativações poderia sair um pouco melhor.
+
+**E3: pular os picks de menor peso** (estilo MC-MoE ODP). Os picks são
+removidos em todos os tokens, sem renormalizar:
+
+| | perplexidade | top-1 igual |
+|---|---|---|
+| pular o pick 8 | ×1,018 | 94,9% |
+| pular os picks 7–8 | ×1,049 | 92,3% |
+
+Pular o pick 8 só quando ele é miss custa ainda menos e corta ~1/8 das
+leituras de miss. É um bom complemento ao cache em duas resoluções.

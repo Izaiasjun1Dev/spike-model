@@ -14,6 +14,11 @@ since they live in RAM anyway. Variants:
                    the error the method itself adds, to subtract mentally
   q3, q2           every expert call at 3 / 2 bits
   q2 rank 5-8      the four lowest-weight picks of each token at 2 bits
+  q3/q2 by rank    same, with the four highest-weight picks at 3 bits
+  skip rank 8 / 7-8  drop the lowest-weight pick(s) of every token without
+                   renormalizing (upper bound on skipping low-weight misses)
+  ... hadamard     the low-bit copy quantizes W·H (H a Hadamard rotation of
+                   the input dim) and rotates activations to match
   q2 on p% calls   a random p% of expert calls at 2 bits, the rest at 4: a
                    tiered cache where hits are 4-bit and misses are served
                    from a 2-bit copy (reads ~half the bytes)
@@ -51,6 +56,7 @@ class TieredMoE(nn.Module):
         super().__init__()
         self.block = block
         self.lo = None
+        self.hi = None  # low-bit copy for the other calls; None = stock 4-bit
         self.rule = "ref"  # ref | all | rank | p<float>
 
     def __call__(self, x):
@@ -63,6 +69,12 @@ class TieredMoE(nn.Module):
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if b.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
+        if self.rule.startswith("skip"):
+            # drop the n lowest-weight picks, as if their misses were skipped
+            rank = mx.argsort(mx.argsort(-scores, axis=-1), axis=-1)
+            keep = rank < k - int(self.rule[4:])
+            y = b.switch_mlp(x, inds) * keep[..., None]
+            return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         y_lo = self.lo(x, inds)
         if self.rule == "all":
             y = y_lo
@@ -72,22 +84,40 @@ class TieredMoE(nn.Module):
                 use_lo = rank >= k // 2
             else:
                 use_lo = mx.random.uniform(shape=inds.shape) < float(self.rule[1:])
-            y = mx.where(use_lo[..., None], y_lo, b.switch_mlp(x, inds))
+            hi = self.hi if self.hi is not None else b.switch_mlp
+            y = mx.where(use_lo[..., None], y_lo, hi(x, inds))
         return (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
 
 
-def low_bit_copy(sw, bits: int):
-    """Shallow copy of a quantized SwitchGLU with experts re-quantized."""
+class Rotated(nn.Module):
+    """Quantized switch linear stored as W·H: rotates the input by the same
+    orthonormal Hadamard H so the output is unchanged (H·H = I)."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def __call__(self, x, indices, sorted_indices=False):
+        return self.inner(mx.hadamard_transform(x), indices, sorted_indices=sorted_indices)
+
+
+def low_bit_copy(sw, bits: int, rotate: bool = False):
+    """Shallow copy of a quantized SwitchGLU with experts re-quantized.
+
+    rotate: quantize W·H instead of W (incoherence processing, as in QuIP#),
+    which spreads outlier weights across each group before rounding."""
     lo = copy.copy(sw)
     for name in ("gate_proj", "up_proj", "down_proj"):
         src = getattr(sw, name)
         dst = copy.copy(src)
         w = mx.dequantize(src.weight, src.scales, src.biases,
                           group_size=src.group_size, bits=src.bits)
+        if rotate:
+            w = mx.hadamard_transform(w.astype(mx.float32)).astype(w.dtype)
         dst.weight, dst.scales, dst.biases = mx.quantize(w, group_size=src.group_size, bits=bits)
         dst.bits = bits
         mx.eval(dst.weight, dst.scales, dst.biases)
-        setattr(lo, name, dst)
+        setattr(lo, name, Rotated(dst) if rotate else dst)
     return lo
 
 
@@ -125,6 +155,7 @@ def main():
     ap.add_argument("--gen-tokens", type=int, default=160)
     ap.add_argument("--seq-len", type=int, default=768)
     ap.add_argument("--json", type=Path, default=Path("traces/quality.json"))
+    ap.add_argument("--only", help="comma-separated variant names; merges into --json")
     args = ap.parse_args()
 
     model, tokenizer = load(args.model)
@@ -133,6 +164,7 @@ def main():
     ntok = sum(len(t) - 1 for _, t in corpus)
     print(f"corpus: {len(corpus)} sequences, {ntok} scored tokens ({time.time() - t0:.0f}s)")
 
+    results = {}
     wraps = install(model)
     ref = []  # per sequence: (log-probs f16, top-1, nll of text)
     for _, toks in corpus:
@@ -143,20 +175,33 @@ def main():
         mx.eval(ref[-1])
 
     variants = [(4, "all", "q4 re-quant floor"), (3, "all", "q3"), (2, "all", "q2"), (2, "rank", "q2 rank 5-8"),
-                (2, "p0.25", "q2 on 25% calls"), (2, "p0.5", "q2 on 50% calls")]
-    results = {}
+                (2, "p0.25", "q2 on 25% calls"), (2, "p0.5", "q2 on 50% calls"),
+                (2, "rank3", "q3/q2 by rank"),
+                (3, "all", "q3 hadamard", True), (2, "all", "q2 hadamard", True),
+                (2, "rank", "q2 hadamard rank 5-8", True),
+                (2, "skip1", "skip rank 8"), (2, "skip2", "skip ranks 7-8")]
+    if args.only:
+        variants = [v for v in variants if v[2] in args.only.split(",")]
+        if args.json.exists():
+            results = json.loads(args.json.read_text())["variants"]
     built = None
-    for bits, rule, name in variants:
-        if built != bits:
+    for bits, rule, name, *rot in variants:
+        rotate = bool(rot and rot[0])
+        if built != (bits, rotate):
             for w in wraps:
                 w.lo = None
             mx.clear_cache()
             for w in wraps:
-                w.lo = low_bit_copy(w.block.switch_mlp, bits)
-            built = bits
+                w.lo = low_bit_copy(w.block.switch_mlp, bits, rotate)
+            built = (bits, rotate)
         mx.random.seed(0)
         for w in wraps:
+            w.hi = None
             w.rule = rule
+        if rule == "rank3":
+            for w in wraps:
+                w.hi = low_bit_copy(w.block.switch_mlp, 3)
+                w.rule = "rank"
         kl = agree = dnll = 0.0
         for (_, toks), (rlp, rtop, rnll) in zip(corpus, ref):
             lp = logprobs(model, toks)
