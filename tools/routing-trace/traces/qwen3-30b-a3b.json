@@ -1,0 +1,234 @@
+{
+  "model": "mlx-community/Qwen3-30B-A3B-4bit",
+  "num_layers": 48,
+  "num_experts": 128,
+  "top_k": 8,
+  "dtype": "uint8",
+  "layout": "token,layer,k (k sorted by descending router score)",
+  "tokens": 21729,
+  "temp": 0.7,
+  "seed": 0,
+  "max_tokens": 1024,
+  "sequences": [
+    {
+      "id": "code-rust-lru",
+      "category": "code",
+      "thinking": false,
+      "prompt_tokens": 42,
+      "prefill_positions": 41,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 0
+    },
+    {
+      "id": "code-python-parser",
+      "category": "code",
+      "thinking": false,
+      "prompt_tokens": 48,
+      "prefill_positions": 47,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 1025
+    },
+    {
+      "id": "code-explain-backend",
+      "category": "code-long-context",
+      "thinking": false,
+      "prompt_tokens": 1585,
+      "prefill_positions": 1584,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 2050
+    },
+    {
+      "id": "code-review-main",
+      "category": "code-long-context",
+      "thinking": true,
+      "prompt_tokens": 3042,
+      "prefill_positions": 3041,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 3075
+    },
+    {
+      "id": "code-sql",
+      "category": "code",
+      "thinking": false,
+      "prompt_tokens": 50,
+      "prefill_positions": 49,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 4100
+    },
+    {
+      "id": "chat-pt-viagem",
+      "category": "chat-pt",
+      "thinking": false,
+      "prompt_tokens": 64,
+      "prefill_positions": 63,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 5125
+    },
+    {
+      "id": "chat-pt-carreira",
+      "category": "chat-pt",
+      "thinking": false,
+      "prompt_tokens": 58,
+      "prefill_positions": 57,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 6150
+    },
+    {
+      "id": "chat-en-advice",
+      "category": "chat-en",
+      "thinking": false,
+      "prompt_tokens": 41,
+      "prefill_positions": 40,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 7175
+    },
+    {
+      "id": "math-probability",
+      "category": "math",
+      "thinking": true,
+      "prompt_tokens": 50,
+      "prefill_positions": 49,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 8200
+    },
+    {
+      "id": "math-proof",
+      "category": "math",
+      "thinking": true,
+      "prompt_tokens": 31,
+      "prefill_positions": 30,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 9225
+    },
+    {
+      "id": "reasoning-ssd",
+      "category": "reasoning",
+      "thinking": true,
+      "prompt_tokens": 72,
+      "prefill_positions": 71,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 10250
+    },
+    {
+      "id": "writing-story",
+      "category": "writing",
+      "thinking": false,
+      "prompt_tokens": 42,
+      "prefill_positions": 41,
+      "generated_tokens": 967,
+      "decode_tokens": 968,
+      "start": 11275
+    },
+    {
+      "id": "translate-pt-en",
+      "category": "translation",
+      "thinking": false,
+      "prompt_tokens": 1575,
+      "prefill_positions": 1574,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 12243
+    },
+    {
+      "id": "summarize-readme",
+      "category": "summarization",
+      "thinking": false,
+      "prompt_tokens": 1586,
+      "prefill_positions": 1585,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 13268
+    },
+    {
+      "id": "json-extract",
+      "category": "structured",
+      "thinking": false,
+      "prompt_tokens": 58,
+      "prefill_positions": 57,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 14293
+    },
+    {
+      "id": "reasoning-scheduling",
+      "category": "reasoning",
+      "thinking": true,
+      "prompt_tokens": 88,
+      "prefill_positions": 87,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 15318
+    },
+    {
+      "id": "writing-poem-pt",
+      "category": "writing",
+      "thinking": false,
+      "prompt_tokens": 55,
+      "prefill_positions": 54,
+      "generated_tokens": 895,
+      "decode_tokens": 896,
+      "start": 16343
+    },
+    {
+      "id": "translate-en-pt",
+      "category": "translation",
+      "thinking": false,
+      "prompt_tokens": 955,
+      "prefill_positions": 954,
+      "generated_tokens": 955,
+      "decode_tokens": 956,
+      "start": 17239
+    },
+    {
+      "id": "summarize-data-rs",
+      "category": "summarization",
+      "thinking": false,
+      "prompt_tokens": 2104,
+      "prefill_positions": 2103,
+      "generated_tokens": 685,
+      "decode_tokens": 686,
+      "start": 18195
+    },
+    {
+      "id": "json-api",
+      "category": "structured",
+      "thinking": false,
+      "prompt_tokens": 43,
+      "prefill_positions": 42,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 18881
+    },
+    {
+      "id": "chat-zh-2",
+      "category": "chat-zh",
+      "thinking": false,
+      "prompt_tokens": 39,
+      "prefill_positions": 38,
+      "generated_tokens": 1024,
+      "decode_tokens": 1025,
+      "start": 19906
+    },
+    {
+      "id": "chat-zh",
+      "category": "chat-zh",
+      "thinking": false,
+      "prompt_tokens": 43,
+      "prefill_positions": 42,
+      "generated_tokens": 797,
+      "decode_tokens": 798,
+      "start": 20931
+    }
+  ]
+}
