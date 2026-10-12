@@ -13,7 +13,7 @@ impõe; tudo que o cache acertar depois é ganho sobre esse número.
 |---|---|---|
 | `pread` | `pread` em pool de threads, arquivo aberto com `F_NOCACHE` (no Linux, `O_DIRECT`) | Não |
 | `mmap` | `mmap` do arquivo inteiro + `memcpy` do expert (`MADV_RANDOM`) | Sim |
-| `metal` | `MTLIOCommandQueue` carregando direto num `MTLBuffer` (storage shared). Requer macOS 14+ | Não documentado |
+| `metal` | `MTLIOCommandQueue` carregando direto num `MTLBuffer` (storage shared). Requer macOS 14+ | Sim (medido: popula e lê do cache) |
 
 Todos os offsets e tamanhos são alinhados a 16 KiB (página do Apple Silicon).
 
@@ -35,7 +35,14 @@ target/release/expert-bench run --path ~/experts.bin --method pread --preset qwe
 scripts/sweep.sh ~/experts.bin qwen3-235b-a22b 5
 ```
 
-Antes de rodar `mmap`, rode `sudo purge` para esvaziar o page cache.
+Rode `sudo purge` antes de medir: `metal` e `mmap` populam o page cache, e até o
+`pread` com `F_NOCACHE` lê do cache quando as páginas já estão lá. O `sweep.sh`
+pede o sudo uma vez e faz `purge` antes de cada rodada.
+
+Cada `run` imprime no stderr a fração do arquivo que está no page cache
+(`mmap` + `mincore`) antes e depois do loop, e coloca os dois valores no
+`RESULT` como `resident_pct` e `resident_end_pct`. Se `resident_pct` não for ~0,
+o número de GB/s não é só SSD.
 
 ## Parâmetros
 
@@ -84,5 +91,8 @@ RESULT method=pread expert_bytes=2654208 topk=8 layers=48 lookahead=0 ... gbps=2
 - `--compute-us` é espera ativa na CPU, não carga real de GPU, então não reproduz
   a disputa de banda de memória entre GPU e SSD. Para medir isso será preciso um
   kernel Metal de verdade rodando em paralelo.
-- O backend `metal` foi verificado só em compilação (`cargo check --target
-  aarch64-apple-darwin`); ainda não rodou num Mac.
+- `--verify` lê só o cabeçalho de cada bloco de 4 KiB; ele confere offsets, não
+  o conteúdo inteiro.
+- Expert repetido dentro da mesma rodada pode vir do page cache no `metal`/`mmap`
+  (com 1 token do 235B num arquivo de 96 GB, ~4% das leituras; com 5 tokens, ~17%).
+  Para o número de SSD puro, use `pread` ou poucos tokens com `resident_pct=0`.
