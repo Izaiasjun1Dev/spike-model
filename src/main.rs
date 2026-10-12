@@ -175,6 +175,21 @@ fn spin(d: Duration) {
     }
 }
 
+/// Logs and returns how much of the test file sits in the page cache
+/// (-1 if it could not be measured, so the RESULT line stays parseable).
+fn residency(path: &std::path::Path, when: &str) -> f64 {
+    match data::resident_pct(path) {
+        Ok(pct) => {
+            eprintln!("page cache  {pct:.2}% of file resident ({when})");
+            pct
+        }
+        Err(e) => {
+            eprintln!("warning: page cache residency check failed ({when}): {e}");
+            -1.0
+        }
+    }
+}
+
 fn run(args: RunArgs) -> Result<(), String> {
     let shape = shape(&args)?;
     let file_len = std::fs::metadata(&args.path)
@@ -237,6 +252,8 @@ fn run(args: RunArgs) -> Result<(), String> {
         threads,
     );
 
+    let resident_start = residency(&args.path, "start");
+
     let mut rng = Rng(args.seed);
     let mut picks = Vec::with_capacity(shape.topk);
     let mut offsets: Vec<Vec<u64>> = vec![Vec::new(); slots];
@@ -274,6 +291,7 @@ fn run(args: RunArgs) -> Result<(), String> {
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
+    let resident_end = residency(&args.path, "end");
 
     stalls.sort();
     token_times.sort();
@@ -301,7 +319,7 @@ fn run(args: RunArgs) -> Result<(), String> {
         println!("verify      ok ({} experts)", total * shape.topk);
     }
     println!(
-        "RESULT method={} expert_bytes={} topk={} layers={} lookahead={} threads={} compute_us={} gbps={gbps:.3} tok_s={tps:.3}",
+        "RESULT method={} expert_bytes={} topk={} layers={} lookahead={} threads={} compute_us={} gbps={gbps:.3} tok_s={tps:.3} resident_pct={resident_start:.2} resident_end_pct={resident_end:.2}",
         args.method.to_possible_value().unwrap().get_name(),
         shape.expert_bytes,
         shape.topk,

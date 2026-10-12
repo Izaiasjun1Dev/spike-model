@@ -137,6 +137,42 @@ pub fn generate(path: &Path, size: u64) -> io::Result<()> {
 
 pub const GIB: f64 = (1u64 << 30) as f64;
 
+/// Percentage of `path` currently held in the OS page cache (mmap + mincore).
+/// Mapping without touching the pages does not fault anything in, so this
+/// does not disturb what it measures.
+pub fn resident_pct(path: &Path) -> io::Result<f64> {
+    use std::os::fd::AsRawFd;
+    let file = File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    if len == 0 {
+        return Ok(0.0);
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mut vec = vec![0u8; len.div_ceil(page)];
+    let rc = unsafe { libc::mincore(ptr, len, vec.as_mut_ptr() as _) };
+    let err = io::Error::last_os_error();
+    unsafe { libc::munmap(ptr, len) };
+    if rc != 0 {
+        return Err(err);
+    }
+    // Bit 0 is "resident" on both macOS (MINCORE_INCORE) and Linux.
+    let resident = vec.iter().filter(|&&b| b & 1 != 0).count();
+    Ok(100.0 * resident as f64 / vec.len() as f64)
+}
+
 pub fn physical_memory() -> u64 {
     unsafe {
         let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
@@ -161,6 +197,20 @@ mod tests {
         }
         assert!(verify(&buf, 0x10000).is_ok());
         assert!(verify(&buf, 0x20000).is_err());
+    }
+
+    #[test]
+    fn resident_pct_in_range() {
+        let dir = std::env::temp_dir().join(format!("expert-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty");
+        let full = dir.join("full");
+        std::fs::write(&empty, b"").unwrap();
+        std::fs::write(&full, vec![7u8; 4 * ALIGN]).unwrap();
+        assert_eq!(resident_pct(&empty).unwrap(), 0.0);
+        let pct = resident_pct(&full).unwrap();
+        assert!((0.0..=100.0).contains(&pct), "{pct}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
