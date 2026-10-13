@@ -27,8 +27,12 @@ lendo os experts do SSD sob demanda. Há quatro partes:
   idêntico não é critério, 1 ulp troca tokens). `MOE_PROFILE=1` imprime o
   tempo por token (leitura, GPU, resto). Os experts em RAM ficam numa arena
   (um array por tensor, `[slots, ...]`), e cada camada roda um `gather_qmm`
-  por projeção indexado por slot. No 235B com 6 GB de cache (pico de 12 GB):
-  ~3 tok/s; com 10 GB (16 GB): ~4 tok/s, `--bias 1`.
+  por projeção indexado por slot. Com `experts_lo.bin` no pack
+  (`engine/packlo.py`, cópias em codebook de 2,5 bits) há uma segunda arena
+  e um kernel Metal próprio (`cbkernel.rs`). No 235B com 6 GB de cache (pico
+  de 12 GB), `--bias 1`: só q4 3,3 tok/s; duas resoluções 3,4; `--lo-all`
+  (tudo em codebook, ppl ×1,14) 5,8; com 10 GB, 7,0. Duas resoluções e bias
+  disputam os mesmos picks de menor peso, e o bias ganha.
 
 O README.md e o `tools/routing-trace/README.md` guardam os resultados de cada
 experimento. Quando um experimento novo terminar, acrescente os números lá, no
@@ -183,7 +187,10 @@ Não funcionou (não repita do mesmo jeito):
   tok/s cai (4,67→4,41 com 20% de cache). Com pouca RAM, só rende o que
   reduz os bytes lidos por token.
 
-Próximo passo: ajuste fino só do roteador para chegar ao acerto do `bias1`
+Próximo passo no motor: custo de GPU por camada (~1 ms, agora a maior
+parcela no modo `--lo-all`), e um codebook melhor (d8/k65536, ou ajuste fino
+dos codebooks) para o modo tudo-em-codebook custar menos que ×1,14.
+Depois: ajuste fino só do roteador para chegar ao acerto do `bias1`
 (~83% com 16 GB) com perda perto de ×1,02, o que daria ~6,4 tok/s com
 qualidade melhor que a do design atual. É o candidato a treino em escala (com
 muitos tokens; talvez na AWS). Outras ideias ainda não testadas: layout

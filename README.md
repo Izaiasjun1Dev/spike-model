@@ -237,10 +237,45 @@ prefill) e os 4,5 GB de pesos fixos:
 | **10 GB** | **1** | 43,4% | 3,9 | **4,05** | 16 GB |
 
 Numa máquina de 16 GB, a configuração honesta é a de 6 GB de cache (pico de 12
-GB): ~3 tok/s com `bias 1`. O prefill lê quase o modelo inteiro (~127 GB para
-46 tokens, ~7 tok/s), porque poucos tokens já usam quase todos os experts de
-cada camada. O que falta agora é reduzir os bytes por token: a leitura é 70%
-do tempo, e o acerto do cache com 6 GB é só 34%.
+GB). O prefill lê quase o modelo inteiro (~127 GB para 46 tokens, ~7 tok/s),
+porque poucos tokens já usam quase todos os experts de cada camada.
+
+### Experts em codebook no motor (`engine/packlo.py`, `--lo-frac`, `--lo-all`)
+
+`packlo.py` acrescenta ao pack uma cópia de cada expert em codebook de 2,5
+bits (`cbq.py`: linhas normalizadas, rotação de Hadamard, 1024 vetores de 4
+pesos por camada e projeção; 0,56 dos bytes do q4; os resultados de qualidade
+estão em `tools/routing-trace/README.md`). O `moe-run` roda essas cópias com
+um kernel Metal próprio (`cbkernel.rs`), que reconstrói os pesos do codebook
+dentro da multiplicação. Dois modos:
+
+- **duas resoluções** (padrão com `experts_lo.bin` no pack): a metade de
+  menor peso dos picks usa qualquer cópia residente ou lê a cópia em
+  codebook; a outra metade exige q4; o pick de menor peso é pulado num miss.
+  `--lo-frac` dá a fração do cache para cópias em codebook.
+- **`--lo-all`**: todo pick pode usar a cópia em codebook (perplexidade
+  ×1,139 no 30B, medida pelo `codebook.py`).
+
+Qwen3-235B, 6 GB de cache (pico de ~12 GB), 100 tokens:
+
+| modo | bias | acerto | GB/token | leitura | GPU | tok/s |
+|---|---|---|---|---|---|---|
+| só q4 | 0 | 23,0% | 6,1 | 284 | 107 | 2,52 |
+| duas resoluções | 0 | 21,9% | 5,0 | 202 | 104 | 3,17 |
+| só q4 | 1 | 33,6% | 5,0 | 201 | 98 | 3,27 |
+| duas resoluções | 1 | 33,9% | 4,5 | 181 | 103 | 3,41 |
+| **`--lo-all`, cache todo em codebook** | 0,5 | 39,8% | 2,7 | 81 | 100 | 5,20 |
+| **`--lo-all`, cache todo em codebook** | **1** | 45,0% | 2,4 | 65 | 98 | **5,82** |
+| `--lo-all`, 10 GB de cache (pico 15,5 GB) | 1 | 53,5% | 1,8 | 40 | 95 | 7,00 |
+
+As duas resoluções rendem o que o replay previa quando o roteador é o
+original (+26% com bias 0), mas quase nada com `bias 1` (+4%): o bias puxa
+os picks de menor peso para os experts residentes, então os misses que
+sobram são os de maior peso, que exigem q4. As duas técnicas disputam os
+mesmos picks, e o bias ganha. Com todos os picks em codebook, os bytes por
+token caem a 0,56 e o tok/s em 6 GB vai de 3,27 para 5,82 (×1,8), ao custo
+de perplexidade ×1,14 (mais o do bias). Nesse ponto a GPU volta a ser a
+maior parcela (98 contra 65 ms), e a próxima alavanca é o custo por camada.
 
 ## Parâmetros
 

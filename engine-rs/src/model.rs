@@ -111,7 +111,11 @@ pub struct Model {
     pub tiered: bool,
     /// Drop the lowest-weight pick when it is a miss (no read, no compute).
     pub skip_last_miss: bool,
+    /// Every pick may use the codebook copy (quality x1.14, bytes x0.56).
+    pub lo_all: bool,
     pub skipped: u64,
+    /// Prefetched as a codebook copy, then needed as q4.
+    pub prefetch_lo_wrong: u64,
     /// Prefetches in flight, per layer, keyed by (expert, lo copy?).
     pending: Vec<HashMap<(usize, bool), Pending>>,
     /// Codebooks per layer: [gate, up, down], each [K, D] f16.
@@ -199,7 +203,9 @@ impl Model {
             prefetch: true,
             tiered,
             skip_last_miss: tiered,
+            lo_all: false,
             skipped: 0,
+            prefetch_lo_wrong: 0,
             codebooks,
             kernels: Kernels::new(),
         };
@@ -306,7 +312,7 @@ impl Model {
     /// Which copy a pick needs: the q4 one for the top half by weight, the
     /// codebook one for the rest (any resident copy serves those).
     fn needs_lo(&self, rank: usize) -> bool {
-        self.tiered && rank >= self.cfg.top_k / 2
+        self.tiered && (self.lo_all || rank >= self.cfg.top_k / 2)
     }
 
     /// Routed experts: route, read the misses, run the needed experts.
@@ -366,8 +372,7 @@ impl Model {
             let s = match (cache.hi.get(&e), cache.lo.get(&e), need_lo[j]) {
                 (Some(&s), _, _) => Serve::Hi(s),
                 (None, Some(&s), true) => Serve::Lo(s),
-                _ if decode && self.skip_last_miss && rank[j] == k - 1
-                    && !self.pending[i].contains_key(&(e, false)) && !self.pending[i].contains_key(&(e, need_lo[j])) => Serve::Skip,
+                _ if decode && self.skip_last_miss && rank[j] == k - 1 => Serve::Skip,
                 _ => Serve::Read(need_lo[j]),
             };
             if matches!(s, Serve::Hi(_) | Serve::Lo(_)) {
@@ -385,8 +390,12 @@ impl Model {
             if reads.contains_key(&(e, lo)) || (lo && reads.contains_key(&(e, false))) {
                 continue;
             }
-            // A pending q4 copy serves a low pick too.
+            // A pending q4 copy serves a low pick too; a pending codebook copy
+            // cannot serve a high one (it is dropped as stale below).
             let key = if self.pending[i].contains_key(&(e, lo)) { (e, lo) } else { (e, false) };
+            if !lo && self.pending[i].contains_key(&(e, true)) {
+                self.prefetch_lo_wrong += 1;
+            }
             match self.pending[i].remove(&key) {
                 Some(p) => {
                     self.store.promote(&p);
@@ -408,6 +417,9 @@ impl Model {
             order.sort_by(|a, b| w[*b].total_cmp(&w[*a]));
             let next = &self.layers[i + 1].cache;
             for (r, &j) in order.iter().enumerate() {
+                if self.skip_last_miss && r == k - 1 {
+                    continue; // a miss on the lowest pick is skipped, not read
+                }
                 let (e, lo) = (g[j], self.needs_lo(r));
                 let served = next.hi.contains_key(&e) || (lo && next.lo.contains_key(&e));
                 let queued = self.pending[i + 1].contains_key(&(e, false)) || (lo && self.pending[i + 1].contains_key(&(e, true)));

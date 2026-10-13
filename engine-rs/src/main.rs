@@ -1,7 +1,7 @@
 //! moe-run: chat with a large MoE model whose experts stay on the SSD.
 //!
 //!   moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5]
-//!           [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--no-prefetch] [--dump-logits FILE]
+//!           [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--lo-all] [--no-prefetch] [--dump-logits FILE]
 //!           [--score IDS_FILE --n-prompt N --dump-logits FILE]   (teacher forcing, for tests)
 //!
 //! <pack> is a directory written by engine/pack.py.
@@ -32,13 +32,14 @@ struct Args {
     prefetch: bool,
     tiered: bool,
     skip_last: bool,
+    lo_all: bool,
     /// Teacher forcing: a file of u32 token ids, and how many form the prompt.
     score: Option<PathBuf>,
     n_prompt: usize,
 }
 
 fn parse_args() -> Res<Args> {
-    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--no-prefetch] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
+    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--lo-all] [--no-prefetch] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         pack: PathBuf::new(),
@@ -53,6 +54,7 @@ fn parse_args() -> Res<Args> {
         prefetch: true,
         tiered: true,
         skip_last: true,
+        lo_all: false,
         score: None,
         n_prompt: 0,
     };
@@ -71,6 +73,7 @@ fn parse_args() -> Res<Args> {
             "--lo-frac" => a.lo_frac = val()?.parse()?,
             "--no-tiered" => a.tiered = false,
             "--no-skip-last" => a.skip_last = false,
+            "--lo-all" => a.lo_all = true,
             "--score" => a.score = Some(val()?.into()),
             "--n-prompt" => a.n_prompt = val()?.parse()?,
             "-h" | "--help" => return Err(usage.into()),
@@ -134,10 +137,11 @@ fn reply(model: &mut Model, tok: &Tokenizer, kv: &mut KvCache, text: &str, args:
     if std::env::var_os("MOE_PROFILE").is_some() {
         let ms = |d: std::time::Duration| 1e3 * d.as_secs_f64() / out.len().max(1) as f64;
         eprintln!(
-            "[profile, decode only, ms per token: pread {:.0} | GPU sync {:.0} | other {:.0} | total {:.0}]",
+            "[profile, decode only, ms per token: pread {:.0} | GPU sync {:.0} | other {:.0} | total {:.0} | codebook prefetches needed as q4: {}]",
             ms(model.store.t_io - io0), ms(model.t_sync - sync0),
             ms(t1.elapsed() - (model.store.t_io - io0) - (model.t_sync - sync0)),
-            1e3 * t_gen / out.len().max(1) as f64
+            1e3 * t_gen / out.len().max(1) as f64,
+            model.prefetch_lo_wrong
         );
     }
     let s = model.stats();
@@ -175,6 +179,7 @@ fn run() -> Res<()> {
     let mut model = Model::load(&args.pack, args.cache_gb, if args.tiered { args.lo_frac } else { 0.0 }, args.bias, args.threads)?;
     model.prefetch = args.prefetch;
     model.skip_last_miss = args.skip_last && model.tiered;
+    model.lo_all = args.lo_all && model.tiered;
     let st = model.stats();
     eprintln!(
         "[loaded in {:.1}s, {} q4 + {} codebook experts cached per layer, arenas {:.1} GB, bias {}{}]\n",
