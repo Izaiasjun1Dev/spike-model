@@ -40,6 +40,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model", help="Hugging Face repo id or local path of an MLX MoE model")
     ap.add_argument("out", type=Path)
+    ap.add_argument("--consume", action="store_true",
+                    help="delete each source shard once its tensors are packed (the download is "
+                         "gone afterwards; for models too big to hold twice on disk)")
     args = ap.parse_args()
 
     src = Path(args.model) if Path(args.model).exists() else Path(snapshot_download(args.model))
@@ -57,16 +60,35 @@ def main():
     # Layers with routed experts (DeepSeek-V3 models start with dense layers).
     moe_layers = sorted({int(m.group(1)) for k in weight_map if (m := EXPERT_KEY.match(k))})
 
+    # Tensors still unread per shard; a consumed shard is deleted when empty.
+    pending = {}
+    for k, f in weight_map.items():
+        pending.setdefault(f, set()).add(k)
+
     def tensor(name):
         f = weight_map[name]
         if f not in files:
             files[f] = mx.load(str(src / f))
+        pending[f].discard(name)
         return files[f][name]
+
+    def consume():
+        """Drop loaded shards; with --consume, delete the fully read ones."""
+        files.clear()
+        if args.consume:
+            for f in [f for f, left in pending.items() if not left]:
+                del pending[f]
+                real = (src / f).resolve()
+                (src / f).unlink()
+                if real != src / f and real.exists():
+                    real.unlink()  # the blob behind the snapshot symlink
+                print(f"consumed {f}", flush=True)
 
     # Everything but the routed experts goes to model.safetensors.
     base = {k: tensor(k) for k in weight_map if not EXPERT_KEY.match(k)}
     mx.save_safetensors(str(args.out / "model.safetensors"), base, metadata={"format": "mlx"})
     del base
+    consume()
     print(f"model.safetensors: {(args.out / 'model.safetensors').stat().st_size / 1e9:.2f} GB")
 
     layout, slot = None, None
@@ -93,7 +115,7 @@ def main():
                     start = e * slot + t["offset"]
                     buf[start:start + t["nbytes"]] = a.tobytes()
             f.write(buf)
-            files.clear()  # drop the mapped shards so memory stays at one layer
+            consume()  # drop the mapped shards so memory stays at one layer
             print(f"layer {layer + 1}/{n_layers} ({time.time() - t0:.0f}s)", flush=True)
 
     # "layers" counts the MoE layers (slot index = position in moe_layers).

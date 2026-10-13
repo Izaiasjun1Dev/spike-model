@@ -180,6 +180,21 @@ mas essas colunas não foram medidas com eles.
 
 ## Motor de verdade (`engine/` e `engine-rs/`)
 
+Um comando só, pelo `engine/moe.py`:
+
+```bash
+cd engine
+uv run moe.py build                                    # compila o motor (uma vez)
+uv run moe.py get mlx-community/Qwen3-235B-A22B-4bit --fast   # baixa, empacota, cópias em codebook
+uv run moe.py chat qwen3-235b-a22b-4bit --ram 16 --fast       # dimensiona o cache pela RAM e conversa
+```
+
+O motor roda Qwen3-MoE e a arquitetura DeepSeek-V3 / Kimi K2 (atenção MLA
+absorvida, roteador sigmoid com bias de correção, experts compartilhados,
+camadas densas iniciais, RoPE YaRN). No Moonlight-16B-A3B (a mesma
+arquitetura do Kimi K2, 64 experts), a saída bate com o mlx-lm dentro do
+ruído do próprio modelo (KL 2e-4 a 3e-3, top-1 98,5–100%).
+
 `engine/pack.py` converte um modelo MLX em `model.safetensors` (tudo menos os
 experts, que fica na RAM) e `experts.bin` (um slot por camada e expert,
 alinhado a 16 KiB, lido com um único pread). O `moe-run` (`engine-rs/`, Rust

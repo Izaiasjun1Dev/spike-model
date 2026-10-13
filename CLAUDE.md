@@ -22,9 +22,18 @@ lendo os experts do SSD sob demanda. Há quatro partes:
   (roteamento ciente de cache) e prefetch da camada seguinte. Compila contra o
   MLX do pacote Python (`MLX_SYSTEM_DIR=<site-packages>/mlx cargo build
   --release`), sem Xcode; a `mlx-sys` modificada está em `engine-rs/vendor/`.
-  Valide mudanças com `cd engine && uv run test_rust.py ~/packs/qwen3-30b`
-  (KL contra o mlx-lm dentro do ruído do próprio modelo; texto greedy
-  idêntico não é critério, 1 ulp troca tokens). `MOE_PROFILE=1` imprime o
+  Valide mudanças com `cd engine && uv run test_rust.py ~/packs/qwen3-30b
+  --extra=--no-tiered` (KL ~1e-4 contra o mlx-lm; se subir para ~1e-3 algo
+  mudou a ordem de uma soma: o decode soma os picks na ordem do roteador, o
+  prefill na ordem dos slots, como o mlx-lm) e, para a arquitetura
+  DeepSeek-V3, `uv run test_rust.py ~/packs/moonlight-16b --model
+  mlx-community/Moonlight-16B-A3B-Instruct-4-bit --extra=--no-tiered`.
+  Texto greedy idêntico não é critério, 1 ulp troca tokens. `model.rs` tem
+  `Arch::Qwen3` e `Arch::DeepseekV3` (MLA absorvida como no mlx-lm, roteador
+  sigmoid + `e_score_correction_bias`, experts compartilhados, camada 0
+  densa); `experts.json` traz `moe_layers`, e o índice do expert no arquivo é
+  a posição nessa lista. O `engine/moe.py` é o comando único (build, get,
+  chat, list). `MOE_PROFILE=1` imprime o
   tempo por token (leitura, GPU, resto). Os experts em RAM ficam numa arena
   (um array por tensor, `[slots, ...]`), e cada camada roda um `gather_qmm`
   por projeção indexado por slot. Com `experts_lo.bin` no pack
@@ -188,6 +197,10 @@ Não funcionou (não repita do mesmo jeito):
   tok/s cai (4,67→4,41 com 20% de cache). Com pouca RAM, só rende o que
   reduz os bytes lidos por token.
 
+Em andamento (2026-10-13): Kimi-K2-Instruct-4bit (578 GB) baixando para
+rodar o 1T no motor (`pack.py --consume` apaga os shards conforme empacota,
+porque não cabe duas vezes no disco). Moonlight-16B não suporta codebook no
+`down_proj` (1408 não é tamanho de Hadamard); o Kimi suporta (2048/7168).
 Próximo passo no motor: um codebook melhor (d8/k65536, ou ajuste fino dos
 codebooks) para o modo tudo-em-codebook custar menos que ×1,14; prefill em
 codebook (hoje lê o modelo inteiro em q4); e o custo de GPU por camada
