@@ -178,6 +178,42 @@ Nas colunas com duas resoluções, as escolhas vieram do loop sem q2. O acerto
 dos traces `-tiered` é quase igual (82,9% contra 82,7% no bias1 de 16 GB),
 mas essas colunas não foram medidas com eles.
 
+## Motor de verdade (`engine/` e `engine-rs/`)
+
+`engine/pack.py` converte um modelo MLX em `model.safetensors` (tudo menos os
+experts, que fica na RAM) e `experts.bin` (um slot por camada e expert,
+alinhado a 16 KiB, lido com um único pread). O `moe-run` (`engine-rs/`, Rust
+sobre mlx-rs) gera texto lendo os experts sob demanda, com o cache LFU por
+camada e o roteamento ciente de cache (`--bias`). O `engine/engine.py` é a
+referência em Python.
+
+```bash
+cd engine && uv run pack.py mlx-community/Qwen3-235B-A22B-4bit ~/packs/qwen3-235b
+cd engine-rs && MLX_SYSTEM_DIR=<site-packages>/mlx cargo build --release
+target/release/moe-run ~/packs/qwen3-235b --cache-gb 10 --bias 0.5 -p "..."   # ou --chat
+```
+
+O `MLX_SYSTEM_DIR` aponta para o MLX pré-compilado do pacote Python, então não
+precisa de Xcode (a `mlx-sys` está em `engine-rs/vendor/` com essa opção). No
+Qwen3-30B, a saída do `moe-run` é idêntica à do mlx-lm (64 tokens greedy).
+
+Qwen3-235B no M5 Max, SSD frio, 10 GB de cache de experts (pico de RAM de
+~12 GB), 100–200 tokens gerados, perfil com `MOE_PROFILE=1`:
+
+| versão | ms/token | tok/s | leitura | cópia para o MLX | espera da GPU |
+|---|---|---|---|---|---|
+| primeira, bias 0 | 820 | 1,22 | — | — | — |
+| primeira, bias 0,5 | 808 | 1,24 | 303 | 186 | 251 |
+| + leitura direto na memória do MLX | 651 | 1,54 | 308 | 96 | 231 |
+| **+ reuso dos buffers** | **527** | **1,90** | 307 | 2 | 203 |
+
+A leitura já está no limite do SSD (~12 GB/s). O que sobra é a GPU, que espera
+o SSD e é esperada por ele: a sincronização por camada é obrigatória (o
+roteamento decide o que ler), e hoje os dois não se sobrepõem. Empilhar os
+experts para o `gather_qmm` no decode não era o gargalo (tirar isso não mudou
+o tempo). O prefill lê quase o modelo inteiro (~127 GB para 46 tokens), porque
+poucos tokens já usam quase todos os experts de cada camada.
+
 ## Parâmetros
 
 - `--preset qwen3-30b-a3b | qwen3-235b-a22b | deepseek-v3`: camadas MoE, top-k e

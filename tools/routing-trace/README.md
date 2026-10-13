@@ -242,3 +242,36 @@ que o design q4/q2 + skip.
 Uma armadilha: guardar os picks de cada token como arrays MLX pendentes prende
 dois buffers Metal por camada, e a rodada morre com `Resource limit (499000)`
 depois de ~5 mil tokens. Os picks passam para numpy ao fim de cada sequência.
+
+### Experts em codebook (`codebook.py`)
+
+Quantização vetorial no estilo AQLM/QuIP#, sem treino: cada linha do expert é
+normalizada pela própria escala (RMS), dividida em vetores de d pesos, e cada
+vetor vira o índice do centróide mais próximo entre K, num codebook por camada
+e projeção ajustado por k-means. São log2(K)/d bits por peso. Com "Hadamard", o
+codebook quantiza W·H (H é uma rotação ortonormal da dimensão de entrada), e a
+ativação é girada do mesmo jeito. A reconstrução é guardada em 5 bits afins
+para o forward (erro ~0,05, bem abaixo do erro do codebook) e, como no
+`quality.py`, parte dos pesos de 4 bits.
+
+| variante | bits/peso | erro relativo | ppl todos os experts | ppl picks 5–8 | KL picks 5–8 |
+|---|---|---|---|---|---|
+| q2 afim g64 (`quality.py`) | 2,5 | 0,41 | ×1,345 | ×1,034 | 0,044 |
+| d4 k256 | 2,0 | 0,32 | ×183 | — | — |
+| d4 k256 + Hadamard | 2,0 | 0,31 | ×1,398 | ×1,033 | 0,030 |
+| **d4 k1024 + Hadamard** | **2,5** | **0,23** | **×1,139** | **×1,014** | **0,019** |
+
+Sem a rotação, o codebook perde os pesos *outliers*, que o q2 afim preserva com
+as escalas por grupo de 64. O resultado é catastrófico, mesmo com erro
+relativo menor. Com a rotação, o codebook de 2,0 bits empata com o q2 afim de
+2,5 bits nos picks 5–8, e o de 2,5 bits corta a perda pela metade nos dois usos
+(×1,139 contra ×1,345 em todos; ×1,014 contra ×1,034 nos picks 5–8). Isso é só
+k-means simples, sem ponderar pelas ativações e sem ajuste fino. Para virar
+velocidade, falta um kernel Metal que decodifique o codebook dentro do matmul
+(o MLX não tem). O d8 com 65.536 centróides ficou para depois (~4 h de
+k-means).
+
+Armadilha: a cópia em codebook do 30B tem ~29 bilhões de pesos. Guardada em 8
+bits, ela ocupa ~31 GB, além dos 16 GB do modelo, e a máquina de 48 GB entra
+em swap (uma avaliação levou 49 min). Em 5 bits cabe, e o `mx.set_cache_limit`
+evita que os temporários do k-means se acumulem.

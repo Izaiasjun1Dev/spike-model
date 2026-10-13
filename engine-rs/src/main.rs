@@ -1,7 +1,7 @@
 //! moe-run: chat with a large MoE model whose experts stay on the SSD.
 //!
 //!   moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5]
-//!           [--max-tokens 512] [--threads 8] [--dump-logits FILE]
+//!           [--max-tokens 512] [--threads 16] [--dump-logits FILE]
 //!
 //! <pack> is a directory written by engine/pack.py.
 
@@ -28,7 +28,7 @@ struct Args {
 }
 
 fn parse_args() -> Res<Args> {
-    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 8] [--dump-logits FILE]";
+    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--dump-logits FILE]";
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         pack: PathBuf::new(),
@@ -37,7 +37,7 @@ fn parse_args() -> Res<Args> {
         cache_gb: 8.0,
         bias: 0.5,
         max_tokens: 512,
-        threads: 8,
+        threads: 16,
         dump_logits: None,
     };
     let mut pack = None;
@@ -90,6 +90,7 @@ fn reply(model: &mut Model, tok: &Tokenizer, kv: &mut KvCache, text: &str, args:
     let t_prefill = t0.elapsed().as_secs_f64();
     let (mut out, mut shown) = (Vec::new(), String::new());
     let t1 = Instant::now();
+    let (io0, copy0, sync0) = (model.store.t_io, model.store.t_copy, model.t_sync);
     let im_end = tok.token_to_id("<|im_end|>");
     while out.len() < args.max_tokens && !model.cfg.eos.contains(&next) && Some(next) != im_end {
         out.push(next);
@@ -102,6 +103,15 @@ fn reply(model: &mut Model, tok: &Tokenizer, kv: &mut KvCache, text: &str, args:
         next = model::argmax(&model.forward(&[next], kv)?)?;
     }
     let t_gen = t1.elapsed().as_secs_f64();
+    if std::env::var_os("MOE_PROFILE").is_some() {
+        let ms = |d: std::time::Duration| 1e3 * d.as_secs_f64() / out.len().max(1) as f64;
+        eprintln!(
+            "[profile, decode only, ms per token: pread {:.0} | copy into MLX {:.0} | GPU sync {:.0} | other {:.0} | total {:.0}]",
+            ms(model.store.t_io - io0), ms(model.store.t_copy - copy0), ms(model.t_sync - sync0),
+            ms(t1.elapsed() - (model.store.t_io - io0) - (model.store.t_copy - copy0) - (model.t_sync - sync0)),
+            1e3 * t_gen / out.len().max(1) as f64
+        );
+    }
     let s = model.stats();
     println!(
         "\n\n[prompt {} tok, {:.1} tok/s | gen {} tok, {:.2} tok/s | hit {:.1}% | read {:.1} GB | peak RSS {:.1} GB]",

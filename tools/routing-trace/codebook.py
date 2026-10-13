@@ -14,7 +14,7 @@ report near-4-bit quality at 2 bits. This checks that before any kernel work:
 
 Plain k-means, no activation weighting and no fine-tuning, so this is a
 floor for what codebooks can do. The reconstructed weights are stored as
-8-bit affine for the forward pass (error far below the codebook's), and,
+5-bit affine for the forward pass (error far below the codebook's), and,
 like quality.py, start from the 4-bit weights.
 
 Each variant is measured on every expert call ("all") and on the four
@@ -44,6 +44,11 @@ VARIANTS = [  # (name, d, K, rotate)
 SAMPLE = 1 << 20  # vectors used to fit each codebook
 ITERS = 10
 CHUNK = 1 << 13  # vectors per distance block
+# The reconstruction is stored as affine 5-bit for the forward pass: at 8 bits
+# the copy of the 30B's ~29B expert weights alone is ~31 GB, which next to the
+# 16 GB model does not fit in 48 GB. 5 bits adds ~0.05 relative error on top
+# of the codebook's ~0.3 (a slightly pessimistic test).
+STORE_BITS = 5
 
 
 def assign(x: mx.array, c: mx.array) -> mx.array:
@@ -96,8 +101,8 @@ def vq_copy(sw, d: int, k: int, rotate: bool):
             w = mx.hadamard_transform(w)
         rec, err = vq(w, d, k)
         errs.append(err)
-        dst.weight, dst.scales, dst.biases = mx.quantize(rec.astype(mx.bfloat16), group_size=64, bits=8)
-        dst.bits, dst.group_size = 8, 64
+        dst.weight, dst.scales, dst.biases = mx.quantize(rec.astype(mx.bfloat16), group_size=64, bits=STORE_BITS)
+        dst.bits, dst.group_size = STORE_BITS, 64
         mx.eval(dst.weight, dst.scales, dst.biases)
         setattr(lo, name, Rotated(dst) if rotate else dst)
     return lo, errs
@@ -125,6 +130,9 @@ def main():
     args = ap.parse_args()
 
     mx.random.seed(0)
+    # The k-means temporaries are ~0.8 GB per projection; without a limit
+    # MLX keeps the freed buffers cached and the run grows past 48 GB.
+    mx.set_cache_limit(2 << 30)
     model, tokenizer = load(args.model)
     t0 = time.time()
     corpus = build_corpus(model, tokenizer, args.gen_tokens, args.seq_len)

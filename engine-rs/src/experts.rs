@@ -7,7 +7,8 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use mlx_rs::{Array, Dtype};
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{Array, Dtype, ops};
 
 pub type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -32,6 +33,11 @@ pub struct Store {
     pub bits: i32,
     threads: usize,
     pub bytes_read: u64,
+    /// Time spent in preads, and copying the bytes into MLX arrays.
+    pub t_io: std::time::Duration,
+    pub t_copy: std::time::Duration,
+    /// Slot buffers of experts that left, reused by the next reads.
+    free: Vec<Array>,
 }
 
 impl Store {
@@ -70,48 +76,110 @@ impl Store {
             bits: meta["bits"].as_i64().ok_or("bits")? as i32,
             threads,
             bytes_read: 0,
+            t_io: Default::default(),
+            t_copy: Default::default(),
+            free: Vec::new(),
         })
     }
 
-    /// Reads the given experts of a layer, in parallel, one pread each.
+    /// Reads the given experts of a layer. Each expert is split into CHUNK
+    /// pieces spread over the threads, so a handful of misses still keeps
+    /// many requests in flight (one 10 MiB pread per thread does not).
     pub fn read(&mut self, layer: usize, ids: &[usize]) -> Res<Vec<Expert>> {
-        let mut bufs: Vec<Vec<u8>> = ids.iter().map(|_| vec![0u8; self.slot]).collect();
+        const CHUNK: usize = 2 << 20;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Read straight into MLX-owned memory (unified with the GPU's), then
+        // carve the expert's tensors out of it as views: no second copy.
+        let t1 = std::time::Instant::now();
+        let mut bases = Vec::with_capacity(ids.len());
+        for _ in ids {
+            bases.push(match self.free.pop() {
+                Some(a) => a,
+                None => {
+                    let a = Array::zeros::<u8>(&[self.slot as i32])?;
+                    a.eval()?;
+                    a
+                }
+            });
+        }
+        self.t_copy += t1.elapsed();
         let (file, slot, n) = (&self.file, self.slot, self.experts);
-        let per = ids.len().div_ceil(self.threads.max(1)).max(1);
+        // (file offset, destination address, length) for every chunk of every
+        // expert. Addresses as usize so the jobs can cross threads; each chunk
+        // is written by exactly one thread and nothing reads it meanwhile.
+        let mut jobs: Vec<(u64, usize, usize)> = Vec::new();
+        for (a, &e) in bases.iter().zip(ids) {
+            let base = ((layer * n + e) * slot) as u64;
+            let ptr = a.as_slice::<u8>().as_ptr() as usize;
+            for j in (0..slot).step_by(CHUNK) {
+                jobs.push((base + j as u64, ptr + j, CHUNK.min(slot - j)));
+            }
+        }
+        let threads = self.threads.min(jobs.len()).max(1);
+        let per = jobs.len().div_ceil(threads);
+        let t0 = std::time::Instant::now();
         std::thread::scope(|s| -> Res<()> {
-            let jobs: Vec<_> = bufs
-                .chunks_mut(per)
-                .zip(ids.chunks(per))
-                .map(|(bs, es)| {
+            let handles: Vec<_> = jobs
+                .chunks(per)
+                .map(|js| {
                     s.spawn(move || -> std::io::Result<()> {
-                        for (b, &e) in bs.iter_mut().zip(es) {
-                            file.read_exact_at(b, ((layer * n + e) * slot) as u64)?;
+                        for &(off, addr, len) in js {
+                            let dst = unsafe { std::slice::from_raw_parts_mut(addr as *mut u8, len) };
+                            file.read_exact_at(dst, off)?;
                         }
                         Ok(())
                     })
                 })
                 .collect();
-            for j in jobs {
-                j.join().map_err(|_| "reader thread panicked")??;
+            for h in handles {
+                h.join().map_err(|_| "reader thread panicked")??;
             }
             Ok(())
         })?;
         self.bytes_read += (ids.len() * self.slot) as u64;
-        // MLX copies the bytes into its own buffers here.
-        Ok(bufs
+        self.t_io += t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let out = bases
             .iter()
-            .map(|b| {
-                self.parts
+            .map(|a| -> Res<Expert> {
+                let mut ex = self
+                    .parts
                     .iter()
-                    .map(|p| {
-                        let a = unsafe { Array::from_raw_data(b[p.offset..p.offset + p.nbytes].as_ptr().cast(), &p.shape, p.dtype) };
-                        (p.name.clone(), a)
+                    .map(|p| -> Res<(String, Array)> {
+                        let t = a.index(p.offset as i32..(p.offset + p.nbytes) as i32).view_dtype(p.dtype)?;
+                        Ok((p.name.clone(), ops::reshape(&t, &p.shape)?))
                     })
-                    .collect()
+                    .collect::<Res<Expert>>()?;
+                ex.insert(BASE.to_string(), a.clone());
+                Ok(ex)
             })
-            .collect())
+            .collect::<Res<Vec<_>>>()?;
+        self.t_copy += t1.elapsed();
+        Ok(out)
     }
 }
+
+impl Store {
+    /// Takes back the buffers of experts that left. Only safe once the work
+    /// that read them has run: the caller recycles at the end of a layer, and
+    /// the next read waits for the next layer's routing, which needs it.
+    pub fn recycle(&mut self, gone: Vec<Expert>) {
+        for mut ex in gone {
+            if let Some(b) = ex.remove(BASE) {
+                if self.free.len() < MAX_FREE {
+                    self.free.push(b);
+                }
+            }
+        }
+    }
+}
+
+/// Key of an expert's whole slot buffer, which its tensors are views of.
+const BASE: &str = "slot";
+/// Spare buffers kept (a prefill can drop up to all experts of a layer).
+const MAX_FREE: usize = 16;
 
 /// Per-layer LFU with decay and bypass (the design tools/routing-trace
 /// settled on): `slots` experts stay; scores decay with a half-life of 32
@@ -139,7 +207,9 @@ impl LayerCache {
     }
 
     /// counts: uses of each expert in this call; fetched: experts read for it.
-    pub fn update(&mut self, counts: &[(usize, usize)], mut fetched: HashMap<usize, Expert>) {
+    /// Returns the experts that leave (evicted, or read and not kept), so
+    /// their buffers can be reused.
+    pub fn update(&mut self, counts: &[(usize, usize)], mut fetched: HashMap<usize, Expert>) -> Vec<Expert> {
         for s in self.score.iter_mut() {
             *s *= self.decay;
         }
@@ -147,16 +217,19 @@ impl LayerCache {
             self.score[e] += c as f64;
         }
         if self.slots == 0 {
-            return;
+            return fetched.into_values().collect();
         }
         let mut cand: Vec<usize> = self.experts.keys().chain(fetched.keys()).copied().collect();
         cand.sort_by(|a, b| self.score[*b].total_cmp(&self.score[*a]));
         cand.truncate(self.slots);
-        self.experts.retain(|e, _| cand.contains(e));
+        let evicted: Vec<usize> = self.experts.keys().filter(|e| !cand.contains(e)).copied().collect();
+        let mut gone: Vec<Expert> = evicted.iter().filter_map(|e| self.experts.remove(e)).collect();
         for e in cand {
             if let Some(x) = fetched.remove(&e) {
                 self.experts.insert(e, x);
             }
         }
+        gone.extend(fetched.into_values());
+        gone
     }
 }

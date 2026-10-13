@@ -100,6 +100,8 @@ pub struct Model {
     pub store: Store,
     /// Added to the log-probability of resident experts when routing.
     pub bias: f32,
+    /// Time blocked on the GPU at the per-layer routing sync.
+    pub t_sync: std::time::Duration,
 }
 
 pub struct Stats {
@@ -142,6 +144,7 @@ impl Model {
             cfg,
             store,
             bias,
+            t_sync: Default::default(),
         };
         if let Some(k) = w.keys().next() {
             return Err(format!("unused weight {k}: model.safetensors is not a Qwen3-MoE pack?").into());
@@ -238,7 +241,9 @@ impl Model {
         // The one sync per layer: which experts does this call need?
         // take_axis leaves a strided view; flatten copies it to read on the CPU.
         let flat = ops::flatten(&inds, None, None)?;
+        let t0 = std::time::Instant::now();
         flat.eval()?;
+        self.t_sync += t0.elapsed();
         let picks: Vec<u32> = flat.as_slice::<u32>().to_vec();
         let mut counts: Vec<(usize, usize)> = Vec::new();
         let mut sorted = picks.clone();
@@ -254,8 +259,35 @@ impl Model {
         let missing: Vec<usize> = counts.iter().map(|&(e, _)| e).filter(|e| !cache.experts.contains_key(e)).collect();
         cache.hits += counts.iter().filter(|(e, _)| cache.experts.contains_key(e)).map(|&(_, c)| c as u64).sum::<u64>();
         let fetched: HashMap<usize, Expert> = missing.iter().copied().zip(self.store.read(i, &missing)?).collect();
+        let (gs, bits) = (self.store.group_size, self.store.bits);
 
-        // Stack the needed experts and remap the router's picks onto them.
+        // One token (decode): run each expert on its own weights. Stacking them
+        // for gather_qmm would copy every used expert (cached ones too) again.
+        if picks.len() == self.cfg.top_k {
+            let cache = &self.layers[i].cache;
+            let q = |h: &Array, ex: &Expert, part: &str| -> Res<Array> {
+                let t = |n: &str| &ex[&format!("{part}.{n}")];
+                Ok(ops::quantized_matmul(h, t("weight"), t("scales"), t("biases"), true, gs, bits)?)
+            };
+            let ys = picks
+                .iter()
+                .map(|&p| -> Res<Array> {
+                    let p = p as usize;
+                    let ex = cache.experts.get(&p).or_else(|| fetched.get(&p)).unwrap();
+                    let act = ops::multiply(&mlx_rs::nn::silu(&q(x, ex, "gate_proj")?)?, &q(x, ex, "up_proj")?)?;
+                    q(&act, ex, "down_proj")
+                })
+                .collect::<Res<Vec<_>>>()?;
+            let y = ops::stack(&ys, -2)?; // [1, 1, k, hidden], picks in router order
+            let dtype = y.dtype();
+            let out = ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?;
+            let gone = self.layers[i].cache.update(&counts, fetched);
+            self.store.recycle(gone);
+            return Ok(out);
+        }
+
+        // Several tokens (prefill): stack the needed experts and remap the
+        // router's picks onto them.
         let cache = &self.layers[i].cache;
         let used: Vec<&Expert> = counts.iter().map(|(e, _)| cache.experts.get(e).or_else(|| fetched.get(e)).unwrap()).collect();
         let stack = |name: &str| ops::stack(&used.iter().map(|x| &x[name]).collect::<Vec<_>>(), 0);
@@ -266,7 +298,6 @@ impl Model {
         let remapped: Vec<u32> = picks.iter().map(|&p| pos[p as usize]).collect();
         let idx = Array::from_slice(&remapped, inds.shape());
 
-        let (gs, bits) = (self.store.group_size, self.store.bits);
         let qmm = |h: &Array, part: &str, idx: &Array, sorted: bool| -> Res<Array> {
             let (w, s, b) = (stack(&format!("{part}.weight"))?, stack(&format!("{part}.scales"))?, stack(&format!("{part}.biases"))?);
             Ok(ops::gather_qmm(h, &w, &s, &b, None, idx, true, gs, bits, sorted)?)
@@ -298,7 +329,8 @@ impl Model {
         let dtype = y.dtype();
         let out = ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?;
 
-        self.layers[i].cache.update(&counts, fetched);
+        let gone = self.layers[i].cache.update(&counts, fetched);
+        self.store.recycle(gone);
         Ok(out)
     }
 }
