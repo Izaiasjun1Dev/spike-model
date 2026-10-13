@@ -97,9 +97,17 @@ fn parse_args() -> Res<Args> {
     Ok(a)
 }
 
-/// Qwen3 chat turn, thinking disabled (what enable_thinking=False renders).
-fn turn(user: &str) -> String {
-    format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+/// One user turn in the model's chat template, with the assistant prompt.
+/// Qwen3: thinking disabled (what enable_thinking=False renders). DeepSeek-V3
+/// / Kimi: the Kimi template, with its default system prompt on the first turn.
+fn turn(arch: model::Arch, user: &str, first: bool) -> String {
+    match arch {
+        model::Arch::Qwen3 => format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+        model::Arch::DeepseekV3 => format!(
+            "{}<|im_user|>user<|im_middle|>{user}<|im_end|><|im_assistant|>assistant<|im_middle|>",
+            if first { "<|im_system|>system<|im_middle|>You are a helpful assistant<|im_end|>" } else { "" }
+        ),
+    }
 }
 
 fn peak_rss_gb() -> f64 {
@@ -213,7 +221,8 @@ fn run() -> Res<()> {
         return Ok(());
     }
     if let Some(p) = &args.prompt {
-        reply(&mut model, &tok, &mut kv, &turn(p), &args)?;
+        let t = turn(model.cfg.arch, p, true);
+        reply(&mut model, &tok, &mut kv, &t, &args)?;
         return Ok(());
     }
     let stdin = std::io::stdin();
@@ -225,7 +234,13 @@ fn run() -> Res<()> {
             return Ok(());
         }
         // The previous reply's <|im_end|> was never fed to the model.
-        let prefix = if kv.offset > 0 { "<|im_end|>\n" } else { "" };
-        reply(&mut model, &tok, &mut kv, &format!("{prefix}{}", turn(line.trim())), &args)?;
+        let first = kv.offset == 0;
+        let prefix = match (first, model.cfg.arch) {
+            (true, _) => "",
+            (false, model::Arch::Qwen3) => "<|im_end|>\n",
+            (false, model::Arch::DeepseekV3) => "<|im_end|>",
+        };
+        let t = format!("{prefix}{}", turn(model.cfg.arch, line.trim(), first));
+        reply(&mut model, &tok, &mut kv, &t, &args)?;
     }
 }

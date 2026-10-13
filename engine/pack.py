@@ -44,7 +44,8 @@ def main():
 
     src = Path(args.model) if Path(args.model).exists() else Path(snapshot_download(args.model))
     config = json.loads((src / "config.json").read_text())
-    n_layers, n_experts = config["num_hidden_layers"], config["num_experts"]
+    n_layers = config["num_hidden_layers"]
+    n_experts = config.get("num_experts") or config["n_routed_experts"]  # Qwen3 / DeepSeek-V3 naming
     args.out.mkdir(parents=True, exist_ok=True)
 
     index = src / "model.safetensors.index.json"
@@ -53,6 +54,8 @@ def main():
     else:
         weight_map = {k: "model.safetensors" for k in mx.load(str(src / "model.safetensors"))}
     files: dict[str, dict] = {}
+    # Layers with routed experts (DeepSeek-V3 models start with dense layers).
+    moe_layers = sorted({int(m.group(1)) for k in weight_map if (m := EXPERT_KEY.match(k))})
 
     def tensor(name):
         f = weight_map[name]
@@ -69,7 +72,7 @@ def main():
     layout, slot = None, None
     t0 = time.time()
     with open(args.out / "experts.bin", "wb") as f:
-        for layer in range(n_layers):
+        for layer in moe_layers:
             arrays = {}
             for part in PARTS:
                 name = f"model.layers.{layer}.mlp.switch_mlp.{part}"
@@ -93,13 +96,21 @@ def main():
             files.clear()  # drop the mapped shards so memory stays at one layer
             print(f"layer {layer + 1}/{n_layers} ({time.time() - t0:.0f}s)", flush=True)
 
-    meta = {"layers": n_layers, "experts": n_experts, "slot_bytes": slot, "tensors": layout,
+    # "layers" counts the MoE layers (slot index = position in moe_layers).
+    meta = {"layers": len(moe_layers), "moe_layers": moe_layers, "experts": n_experts, "slot_bytes": slot, "tensors": layout,
             "group_size": config["quantization"]["group_size"], "bits": config["quantization"]["bits"]}
     (args.out / "experts.json").write_text(json.dumps(meta, indent=1) + "\n")
     for p in src.iterdir():
         if p.is_file() and not p.name.endswith(".safetensors") and p.name != "model.safetensors.index.json":
             shutil.copy(p, args.out / p.name)
-    print(f"experts.bin: {n_layers} layers × {n_experts} experts × {slot / 2**20:.2f} MiB")
+    if not (args.out / "tokenizer.json").exists():
+        # tiktoken-based tokenizers (Kimi, Moonlight): the engine needs the
+        # fast-tokenizer form, which transformers can convert to.
+        from transformers import AutoTokenizer
+
+        AutoTokenizer.from_pretrained(src).save_pretrained(args.out)
+        print("tokenizer.json written from the tiktoken vocabulary")
+    print(f"experts.bin: {len(moe_layers)} MoE layers × {n_experts} experts × {slot / 2**20:.2f} MiB")
 
 
 if __name__ == "__main__":

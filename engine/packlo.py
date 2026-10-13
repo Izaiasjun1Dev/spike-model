@@ -99,7 +99,7 @@ def main():
         old.update(codebooks)
         codebooks = old
     mx.save_safetensors(str(cb_path), codebooks, metadata={"format": "mlx"})
-    lo_meta = {"layers": L, "experts": E, "slot_bytes": lo_slot, "tensors": layout,
+    lo_meta = {"layers": L, "moe_layers": meta.get("moe_layers", list(range(L))), "experts": E, "slot_bytes": lo_slot, "tensors": layout,
                "codebook": {"d": cbq.D, "k": cbq.K, "bits": cbq.BITS, "hadamard": True}}
     (args.pack / "experts_lo.json").write_text(json.dumps(lo_meta, indent=1) + "\n")
     print(f"experts_lo.bin: {L} layers × {E} experts × {lo_slot / 2**20:.2f} MiB ({lo_slot / slot:.2f} of q4)")
