@@ -197,22 +197,50 @@ O `MLX_SYSTEM_DIR` aponta para o MLX pré-compilado do pacote Python, então nã
 precisa de Xcode (a `mlx-sys` está em `engine-rs/vendor/` com essa opção). No
 Qwen3-30B, a saída do `moe-run` é idêntica à do mlx-lm (64 tokens greedy).
 
-Qwen3-235B no M5 Max, SSD frio, 10 GB de cache de experts (pico de RAM de
-~12 GB), 100–200 tokens gerados, perfil com `MOE_PROFILE=1`:
+Qwen3-235B no M5 Max, 10 GB de cache de experts, 100–200 tokens gerados,
+perfil com `MOE_PROFILE=1` (ms por token no decode):
 
-| versão | ms/token | tok/s | leitura | cópia para o MLX | espera da GPU |
+| versão | total | leitura | GPU | tok/s |
+|---|---|---|---|---|
+| primeira, bias 0,5 | 808 | 303 (+186 de cópia) | 251 | 1,24 |
+| leitura direto na memória do MLX, buffers reusados | 527 | 307 | 203 | 1,90 |
+| + prefetch da camada seguinte (pre-gating) | 445 | 202 | 225 | 2,25 |
+| **+ arena de slots e um `gather_qmm` por projeção** | **304** | 216 | **83** | **3,29** |
+
+A arena é um array por tensor do expert (`[slots, ...]`), compartilhado por
+todas as camadas: um expert em RAM ocupa o mesmo slot nos nove arrays, a
+leitura do SSD cai direto nele, e a camada roda seus experts com um único
+`gather_qmm` por projeção, indexado pelo slot. Isso trocou ~30 lançamentos de
+kernel por camada por ~6, e a espera da GPU caiu de 225 para 83 ms por token.
+De quebra, os logits ficaram praticamente iguais aos do mlx-lm (KL 1e-4, top-1
+100% em 64 tokens, `engine/test_rust.py`), porque o `gather_qmm` sobre um
+array grande arredonda como o do modelo original.
+
+O prefetch: o roteador da camada l+1 roda sobre a entrada da camada l, e os
+experts que ele escolhe são lidos enquanto a GPU calcula a camada l. As
+leituras de demanda passam sempre na frente, e os palpites que não são usados
+têm os pedaços ainda na fila cancelados: 86% dos palpites são usados, e a
+leitura sobe 11%. No replay com o SSD saturado, o prefetch tinha piorado o
+tok/s; no motor, onde o SSD esperava a GPU, rende +14% (504 → 445 ms).
+
+Orçamento de RAM e bias (`--bias`), 100 tokens, SSD a ~12 GB/s. A memória é
+o pico medido pelo próprio MLX, que inclui a arena (cache + folga para um
+prefill) e os 4,5 GB de pesos fixos:
+
+| cache de experts | bias | acerto | GB/token | tok/s | pico MLX |
 |---|---|---|---|---|---|
-| primeira, bias 0 | 820 | 1,22 | — | — | — |
-| primeira, bias 0,5 | 808 | 1,24 | 303 | 186 | 251 |
-| + leitura direto na memória do MLX | 651 | 1,54 | 308 | 96 | 231 |
-| **+ reuso dos buffers** | **527** | **1,90** | 307 | 2 | 203 |
+| 6 GB | 0 | 23,0% | 6,4 | 2,35 | 12 GB |
+| 6 GB | 0,5 | 28,8% | 5,7 | 2,68 | 12 GB |
+| **6 GB** | **1** | 33,5% | 5,1 | **3,03** | **12 GB** |
+| 10 GB | 0 | 29,6% | 5,6 | 2,70 | 16 GB |
+| 10 GB | 0,5 | 36,7% | 4,7 | 3,29 | 16 GB |
+| **10 GB** | **1** | 43,4% | 3,9 | **4,05** | 16 GB |
 
-A leitura já está no limite do SSD (~12 GB/s). O que sobra é a GPU, que espera
-o SSD e é esperada por ele: a sincronização por camada é obrigatória (o
-roteamento decide o que ler), e hoje os dois não se sobrepõem. Empilhar os
-experts para o `gather_qmm` no decode não era o gargalo (tirar isso não mudou
-o tempo). O prefill lê quase o modelo inteiro (~127 GB para 46 tokens), porque
-poucos tokens já usam quase todos os experts de cada camada.
+Numa máquina de 16 GB, a configuração honesta é a de 6 GB de cache (pico de 12
+GB): ~3 tok/s com `bias 1`. O prefill lê quase o modelo inteiro (~127 GB para
+46 tokens, ~7 tok/s), porque poucos tokens já usam quase todos os experts de
+cada camada. O que falta agora é reduzir os bytes por token: a leitura é 70%
+do tempo, e o acerto do cache com 6 GB é só 34%.
 
 ## Parâmetros
 

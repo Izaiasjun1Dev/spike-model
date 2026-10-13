@@ -1,7 +1,8 @@
 //! moe-run: chat with a large MoE model whose experts stay on the SSD.
 //!
 //!   moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5]
-//!           [--max-tokens 512] [--threads 16] [--dump-logits FILE]
+//!           [--max-tokens 512] [--threads 16] [--no-prefetch] [--dump-logits FILE]
+//!           [--score IDS_FILE --n-prompt N --dump-logits FILE]   (teacher forcing, for tests)
 //!
 //! <pack> is a directory written by engine/pack.py.
 
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use experts::Res;
+use mlx_rs::Array;
 use model::{KvCache, Model};
 use tokenizers::Tokenizer;
 
@@ -25,10 +27,14 @@ struct Args {
     max_tokens: usize,
     threads: usize,
     dump_logits: Option<PathBuf>,
+    prefetch: bool,
+    /// Teacher forcing: a file of u32 token ids, and how many form the prompt.
+    score: Option<PathBuf>,
+    n_prompt: usize,
 }
 
 fn parse_args() -> Res<Args> {
-    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--dump-logits FILE]";
+    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--no-prefetch] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         pack: PathBuf::new(),
@@ -39,6 +45,9 @@ fn parse_args() -> Res<Args> {
         max_tokens: 512,
         threads: 16,
         dump_logits: None,
+        prefetch: true,
+        score: None,
+        n_prompt: 0,
     };
     let mut pack = None;
     while let Some(arg) = it.next() {
@@ -51,12 +60,21 @@ fn parse_args() -> Res<Args> {
             "--max-tokens" => a.max_tokens = val()?.parse()?,
             "--threads" => a.threads = val()?.parse()?,
             "--dump-logits" => a.dump_logits = Some(val()?.into()),
+            "--no-prefetch" => a.prefetch = false,
+            "--score" => a.score = Some(val()?.into()),
+            "--n-prompt" => a.n_prompt = val()?.parse()?,
             "-h" | "--help" => return Err(usage.into()),
             p if pack.is_none() && !p.starts_with('-') => pack = Some(PathBuf::from(p)),
             _ => return Err(format!("unknown argument {arg}\n{usage}").into()),
         }
     }
     a.pack = pack.ok_or(usage)?;
+    if a.score.is_some() {
+        if a.dump_logits.is_none() || a.n_prompt == 0 {
+            return Err(format!("--score needs --n-prompt N and --dump-logits FILE\n{usage}").into());
+        }
+        return Ok(a);
+    }
     if a.prompt.is_none() && !a.chat {
         return Err(format!("pass -p PROMPT or --chat\n{usage}").into());
     }
@@ -90,7 +108,7 @@ fn reply(model: &mut Model, tok: &Tokenizer, kv: &mut KvCache, text: &str, args:
     let t_prefill = t0.elapsed().as_secs_f64();
     let (mut out, mut shown) = (Vec::new(), String::new());
     let t1 = Instant::now();
-    let (io0, copy0, sync0) = (model.store.t_io, model.store.t_copy, model.t_sync);
+    let (io0, sync0) = (model.store.t_io, model.t_sync);
     let im_end = tok.token_to_id("<|im_end|>");
     while out.len() < args.max_tokens && !model.cfg.eos.contains(&next) && Some(next) != im_end {
         out.push(next);
@@ -106,21 +124,24 @@ fn reply(model: &mut Model, tok: &Tokenizer, kv: &mut KvCache, text: &str, args:
     if std::env::var_os("MOE_PROFILE").is_some() {
         let ms = |d: std::time::Duration| 1e3 * d.as_secs_f64() / out.len().max(1) as f64;
         eprintln!(
-            "[profile, decode only, ms per token: pread {:.0} | copy into MLX {:.0} | GPU sync {:.0} | other {:.0} | total {:.0}]",
-            ms(model.store.t_io - io0), ms(model.store.t_copy - copy0), ms(model.t_sync - sync0),
-            ms(t1.elapsed() - (model.store.t_io - io0) - (model.store.t_copy - copy0) - (model.t_sync - sync0)),
+            "[profile, decode only, ms per token: pread {:.0} | GPU sync {:.0} | other {:.0} | total {:.0}]",
+            ms(model.store.t_io - io0), ms(model.t_sync - sync0),
+            ms(t1.elapsed() - (model.store.t_io - io0) - (model.t_sync - sync0)),
             1e3 * t_gen / out.len().max(1) as f64
         );
     }
     let s = model.stats();
     println!(
-        "\n\n[prompt {} tok, {:.1} tok/s | gen {} tok, {:.2} tok/s | hit {:.1}% | read {:.1} GB | peak RSS {:.1} GB]",
+        "\n\n[prompt {} tok, {:.1} tok/s | gen {} tok, {:.2} tok/s | hit {:.1}% | read {:.1} GB | prefetch {}/{} used | peak MLX {:.1} GB, RSS {:.1} GB]",
         prompt.len(),
         prompt.len() as f64 / t_prefill,
         out.len(),
         out.len() as f64 / t_gen.max(1e-9),
         100.0 * s.hit,
         (model.store.bytes_read - read0) as f64 / 1e9,
+        model.store.prefetch_used,
+        model.store.prefetched,
+        mlx_rs::memory::peak_memory()? as f64 / 1e9,
         peak_rss_gb(),
     );
     Ok(out)
@@ -135,16 +156,38 @@ fn main() {
 
 fn run() -> Res<()> {
     let args = parse_args()?;
+    // Freed buffers would otherwise pile up in MLX's cache next to the arena.
+    mlx_rs::memory::set_cache_limit(512 << 20)?;
     let t0 = Instant::now();
     let tok = Tokenizer::from_file(args.pack.join("tokenizer.json")).map_err(|e| e.to_string())?;
     let mut model = Model::load(&args.pack, args.cache_gb, args.bias, args.threads)?;
+    model.prefetch = args.prefetch;
     eprintln!(
-        "[loaded in {:.1}s, {} experts cached per layer, bias {}]\n",
+        "[loaded in {:.1}s, {} experts cached per layer, arena {:.1} GB, bias {}]\n",
         t0.elapsed().as_secs_f64(),
         model.stats().slots,
+        model.stats().arena_gb,
         args.bias
     );
     let mut kv = model.new_cache();
+    if let Some(path) = &args.score {
+        // Feed the given tokens as generation would (prompt as one prefill,
+        // then one at a time) and dump every step's logits as f32 rows.
+        let ids: Vec<u32> = std::fs::read(path)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let mut rows = Vec::new();
+        let mut step = |logits: Array| -> Res<()> {
+            let l = logits.as_type::<f32>()?;
+            l.eval()?;
+            rows.extend(l.as_slice::<f32>().iter().flat_map(|x| x.to_le_bytes()));
+            Ok(())
+        };
+        step(model.forward(&ids[..args.n_prompt], &mut kv)?)?;
+        for &t in &ids[args.n_prompt..ids.len() - 1] {
+            step(model.forward(&[t], &mut kv)?)?;
+        }
+        std::fs::write(args.dump_logits.as_ref().unwrap(), rows)?;
+        return Ok(());
+    }
     if let Some(p) = &args.prompt {
         reply(&mut model, &tok, &mut kv, &turn(p), &args)?;
         return Ok(());

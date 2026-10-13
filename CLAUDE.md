@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## O que é
 
 Spike de pesquisa para rodar LLMs MoE grandes (alvo: Qwen3-235B-A22B) num Mac,
-lendo os experts do SSD sob demanda. Há duas partes:
+lendo os experts do SSD sob demanda. Há quatro partes:
 
 - **`expert-bench`** (Rust, `src/`): mede leituras reais do SSD. `gen` grava um
   arquivo de teste, `run` faz decode sintético com roteador aleatório e sem cache,
@@ -13,6 +13,22 @@ lendo os experts do SSD sob demanda. Há duas partes:
 - **`tools/routing-trace`** (Python + MLX, `uv`): captura o roteamento real do
   Qwen3-30B-A3B (um proxy do 235B), simula políticas de cache e mede a qualidade
   (perplexidade/KL) de experts em poucos bits.
+- **`engine/`** (Python): `pack.py` converte um modelo MLX em
+  `model.safetensors` (tudo menos os experts) + `experts.bin` (um slot de 16 KiB
+  alinhado por camada e expert); `engine.py` é a referência do bloco MoE em
+  streaming, e `test_engine.py` a compara ao mlx-lm.
+- **`engine-rs/`** (Rust sobre mlx-rs, binário `moe-run`): o motor de verdade.
+  Gera texto lendo os experts do SSD, com cache LFU por camada, `--bias`
+  (roteamento ciente de cache) e prefetch da camada seguinte. Compila contra o
+  MLX do pacote Python (`MLX_SYSTEM_DIR=<site-packages>/mlx cargo build
+  --release`), sem Xcode; a `mlx-sys` modificada está em `engine-rs/vendor/`.
+  Valide mudanças com `cd engine && uv run test_rust.py ~/packs/qwen3-30b`
+  (KL contra o mlx-lm dentro do ruído do próprio modelo; texto greedy
+  idêntico não é critério, 1 ulp troca tokens). `MOE_PROFILE=1` imprime o
+  tempo por token (leitura, GPU, resto). Os experts em RAM ficam numa arena
+  (um array por tensor, `[slots, ...]`), e cada camada roda um `gather_qmm`
+  por projeção indexado por slot. No 235B com 6 GB de cache (pico de 12 GB):
+  ~3 tok/s; com 10 GB (16 GB): ~4 tok/s, `--bias 1`.
 
 O README.md e o `tools/routing-trace/README.md` guardam os resultados de cada
 experimento. Quando um experimento novo terminar, acrescente os números lá, no
@@ -160,7 +176,8 @@ Não funcionou (não repita do mesmo jeito):
   do Qwen3 não compartilham subespaço;
 - DWQ com ~20 mil tokens de calibração: overfit e KL pior (precisa de ~2M);
 - fixar experts populares, agrupar experts co-ativados no disco, aquecer o
-  cache com o prefill, prefetch de 1 camada;
+  cache com o prefill, prefetch de 1 camada no replay (com o SSD saturado; no
+  `moe-run`, onde o SSD espera a GPU, o mesmo prefetch rende +14%);
 - prefetch 2–3 camadas à frente com o preditor treinado (`predictor.py`,
   acerto 83,8% em d=2): o acerto do cache sobe, mas lê 23–108% a mais e o
   tok/s cai (4,67→4,41 com 20% de cache). Com pouca RAM, só rende o que

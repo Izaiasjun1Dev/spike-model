@@ -9,7 +9,7 @@ use mlx_rs::ops::indexing::{argmax_axis, take_along_axis, take_axis};
 use mlx_rs::ops::{self, argpartition_axis, argsort_axis};
 use mlx_rs::Array;
 
-use crate::experts::{Expert, LayerCache, Res, Store};
+use crate::experts::{LayerCache, Pending, Res, Store};
 
 pub struct Config {
     pub hidden: i32,
@@ -102,21 +102,33 @@ pub struct Model {
     pub bias: f32,
     /// Time blocked on the GPU at the per-layer routing sync.
     pub t_sync: std::time::Duration,
+    /// While layer l runs, read the experts layer l+1's router picks on
+    /// layer l's input (pre-gating), so the SSD works while the GPU does.
+    pub prefetch: bool,
+    /// Prefetches in flight, per layer.
+    pending: Vec<HashMap<usize, Pending>>,
 }
 
 pub struct Stats {
     pub hit: f64,
     pub gb_read: f64,
+    /// Experts cached per layer.
     pub slots: usize,
+    /// RAM held by the expert arena.
+    pub arena_gb: f64,
 }
 
 impl Model {
     pub fn load(pack: &Path, cache_gb: f64, bias: f32, threads: usize) -> Res<Self> {
         let cfg = Config::load(pack)?;
-        let store = Store::open(pack, threads)?;
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts.json"))?)?;
+        let slot_bytes = meta["slot_bytes"].as_u64().ok_or("experts.json: slot_bytes")? as usize;
+        let cap = (((cache_gb * 1e9) / (cfg.layers * slot_bytes) as f64) as usize).min(cfg.experts);
+        // Besides the caches, the arena needs room for one layer's misses in
+        // a prefill (up to every expert) and the next layer's prefetches.
+        let store = Store::open(pack, cfg.layers * cap + cfg.experts + cfg.top_k, threads)?;
         let mut w = Array::load_safetensors(pack.join("model.safetensors"))?;
-        let slots = ((cache_gb * 1e9) / (cfg.layers * store.slot) as f64) as usize;
-        let slots = slots.min(cfg.experts);
+        let slots = cap;
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             let p = format!("model.layers.{i}");
@@ -145,6 +157,8 @@ impl Model {
             store,
             bias,
             t_sync: Default::default(),
+            prefetch: false,
+            pending: Vec::new(),
         };
         if let Some(k) = w.keys().next() {
             return Err(format!("unused weight {k}: model.safetensors is not a Qwen3-MoE pack?").into());
@@ -161,7 +175,8 @@ impl Model {
         Stats {
             hit: hits as f64 / lookups.max(1) as f64,
             gb_read: self.store.bytes_read as f64 / 1e9,
-            slots: self.layers[0].cache.slots,
+            slots: self.layers[0].cache.cap,
+            arena_gb: (self.store.slots * self.store.slot) as f64 / 1e9,
         }
     }
 
@@ -217,13 +232,15 @@ impl Model {
     }
 
     /// Routed experts: route, read the misses, run the needed experts.
-    fn moe(&mut self, i: usize, x: &Array) -> Res<Array> {
+    /// Router of `layer` on `x`, biased toward that layer's resident experts:
+    /// (gates, top-k indices).
+    fn route(&self, layer: usize, x: &Array) -> Res<(Array, Array)> {
         let k = self.cfg.top_k as i32;
         let n_exp = self.cfg.experts as i32;
-        let gates = ops::softmax_axis(self.layers[i].gate.forward(x, &self.cfg)?, -1, true)?;
+        let gates = ops::softmax_axis(self.layers[layer].gate.forward(x, &self.cfg)?, -1, true)?;
         let sel = if self.bias != 0.0 {
             let mut res = vec![0f32; self.cfg.experts];
-            for e in self.layers[i].cache.experts.keys() {
+            for e in self.layers[layer].cache.experts.keys() {
                 res[*e] = self.bias;
             }
             let res = Array::from_slice(&res, &[n_exp]);
@@ -233,16 +250,29 @@ impl Model {
         };
         let top = Array::from_iter(n_exp - k..n_exp, &[k]);
         let inds = take_axis(argpartition_axis(&sel, -k, -1)?, &top, -1)?;
+        Ok((gates, inds))
+    }
+
+    /// Routed experts: route, read the misses, run the needed experts.
+    fn moe(&mut self, i: usize, x: &Array) -> Res<Array> {
+        let k = self.cfg.top_k as i32;
+        let (gates, inds) = self.route(i, x)?;
         let mut scores = take_along_axis(&gates, &inds, -1)?;
         if self.cfg.norm_topk {
             scores = ops::divide(&scores, &ops::sum_axis(&scores, -1, true)?)?;
         }
 
-        // The one sync per layer: which experts does this call need?
+        // The one sync per layer: which experts does this call need? In decode
+        // it also yields the guess for the next layer.
         // take_axis leaves a strided view; flatten copies it to read on the CPU.
         let flat = ops::flatten(&inds, None, None)?;
+        let guess = if self.prefetch && x.shape()[1] == 1 && i + 1 < self.layers.len() {
+            Some(ops::flatten(&self.route(i + 1, x)?.1, None, None)?)
+        } else {
+            None
+        };
         let t0 = std::time::Instant::now();
-        flat.eval()?;
+        mlx_rs::transforms::eval(std::iter::once(&flat).chain(guess.iter()))?;
         self.t_sync += t0.elapsed();
         let picks: Vec<u32> = flat.as_slice::<u32>().to_vec();
         let mut counts: Vec<(usize, usize)> = Vec::new();
@@ -258,51 +288,60 @@ impl Model {
         cache.lookups += picks.len() as u64;
         let missing: Vec<usize> = counts.iter().map(|&(e, _)| e).filter(|e| !cache.experts.contains_key(e)).collect();
         cache.hits += counts.iter().filter(|(e, _)| cache.experts.contains_key(e)).map(|&(_, c)| c as u64).sum::<u64>();
-        let fetched: HashMap<usize, Expert> = missing.iter().copied().zip(self.store.read(i, &missing)?).collect();
-        let (gs, bits) = (self.store.group_size, self.store.bits);
 
-        // One token (decode): run each expert on its own weights. Stacking them
-        // for gather_qmm would copy every used expert (cached ones too) again.
-        if picks.len() == self.cfg.top_k {
-            let cache = &self.layers[i].cache;
-            let q = |h: &Array, ex: &Expert, part: &str| -> Res<Array> {
-                let t = |n: &str| &ex[&format!("{part}.{n}")];
-                Ok(ops::quantized_matmul(h, t("weight"), t("scales"), t("biases"), true, gs, bits)?)
-            };
-            let ys = picks
-                .iter()
-                .map(|&p| -> Res<Array> {
-                    let p = p as usize;
-                    let ex = cache.experts.get(&p).or_else(|| fetched.get(&p)).unwrap();
-                    let act = ops::multiply(&mlx_rs::nn::silu(&q(x, ex, "gate_proj")?)?, &q(x, ex, "up_proj")?)?;
-                    q(&act, ex, "down_proj")
-                })
-                .collect::<Res<Vec<_>>>()?;
-            let y = ops::stack(&ys, -2)?; // [1, 1, k, hidden], picks in router order
-            let dtype = y.dtype();
-            let out = ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?;
-            let gone = self.layers[i].cache.update(&counts, fetched);
-            self.store.recycle(gone);
-            return Ok(out);
+        // Misses: take over a prefetch already under way, else read on demand.
+        if self.pending.len() < self.layers.len() {
+            self.pending = (0..self.layers.len()).map(|_| HashMap::new()).collect();
         }
+        let mut reads = Vec::with_capacity(missing.len());
+        for &e in &missing {
+            match self.pending[i].remove(&e) {
+                Some(p) => {
+                    self.store.promote(&p);
+                    self.store.prefetch_used += 1;
+                    reads.push((e, p));
+                }
+                None => {
+                    let p = self.store.start(i, e, true)?.ok_or("expert arena full")?;
+                    reads.push((e, p));
+                }
+            }
+        }
+        let stale: Vec<Pending> = self.pending[i].drain().map(|(_, p)| p).collect();
+        // Queue the guesses for the next layer behind the demand reads.
+        if let Some(g) = &guess {
+            let mut want: Vec<usize> = g.as_slice::<u32>().iter().map(|&e| e as usize).collect();
+            want.sort_unstable();
+            want.dedup();
+            for e in want {
+                if !self.layers[i + 1].cache.experts.contains_key(&e) && !self.pending[i + 1].contains_key(&e) {
+                    if let Some(p) = self.store.start(i + 1, e, false)? {
+                        self.pending[i + 1].insert(e, p);
+                    }
+                }
+            }
+        }
+        for p in stale {
+            self.store.discard(p)?;
+        }
+        let fetched: HashMap<usize, usize> =
+            reads.into_iter().map(|(e, p)| Ok((e, self.store.finish(p)?))).collect::<Res<_>>()?;
 
-        // Several tokens (prefill): stack the needed experts and remap the
-        // router's picks onto them.
+        // Every pick is now in the arena: run the experts with one gather_qmm
+        // per projection, indexed by slot (same math as mlx-lm's SwitchGLU,
+        // including its sort for many tokens).
         let cache = &self.layers[i].cache;
-        let used: Vec<&Expert> = counts.iter().map(|(e, _)| cache.experts.get(e).or_else(|| fetched.get(e)).unwrap()).collect();
-        let stack = |name: &str| ops::stack(&used.iter().map(|x| &x[name]).collect::<Vec<_>>(), 0);
-        let mut pos = vec![0u32; self.cfg.experts];
-        for (j, (e, _)) in counts.iter().enumerate() {
-            pos[*e] = j as u32;
-        }
-        let remapped: Vec<u32> = picks.iter().map(|&p| pos[p as usize]).collect();
-        let idx = Array::from_slice(&remapped, inds.shape());
-
+        let slot_of: Vec<u32> = picks
+            .iter()
+            .map(|&p| *cache.experts.get(&(p as usize)).or_else(|| fetched.get(&(p as usize))).unwrap() as u32)
+            .collect();
+        let idx = Array::from_slice(&slot_of, inds.shape());
+        let (gs, bits) = (self.store.group_size, self.store.bits);
+        let arena = &self.store.arena;
         let qmm = |h: &Array, part: &str, idx: &Array, sorted: bool| -> Res<Array> {
-            let (w, s, b) = (stack(&format!("{part}.weight"))?, stack(&format!("{part}.scales"))?, stack(&format!("{part}.biases"))?);
-            Ok(ops::gather_qmm(h, &w, &s, &b, None, idx, true, gs, bits, sorted)?)
+            let t = |n: &str| &arena[self.store.part(&format!("{part}.{n}"))];
+            Ok(ops::gather_qmm(h, t("weight"), t("scales"), t("biases"), None, idx, true, gs, bits, sorted)?)
         };
-        // Same math as mlx-lm's SwitchGLU, including its sort for many tokens.
         let h = ops::expand_dims_axes(x, &[-2, -3])?;
         let sort = idx.size() >= 64;
         let y = if sort {
@@ -330,7 +369,7 @@ impl Model {
         let out = ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?;
 
         let gone = self.layers[i].cache.update(&counts, fetched);
-        self.store.recycle(gone);
+        self.store.release(gone);
         Ok(out)
     }
 }
