@@ -6,7 +6,7 @@ use std::path::Path;
 
 use mlx_rs::fast::{self, ScaledDotProductAttentionMask};
 use mlx_rs::ops::indexing::{argmax_axis, take_along_axis, take_axis};
-use mlx_rs::ops::{self, argpartition_axis, argsort_axis};
+use mlx_rs::ops::{self, argpartition_axis};
 use mlx_rs::Array;
 
 use crate::cbkernel::{hadamard, Kernels};
@@ -113,6 +113,8 @@ pub struct Model {
     pub skip_last_miss: bool,
     /// Every pick may use the codebook copy (quality x1.14, bytes x0.56).
     pub lo_all: bool,
+    /// Prefill with codebook copies too (faster, costs more quality).
+    pub lo_prefill: bool,
     pub skipped: u64,
     /// Prefetched as a codebook copy, then needed as q4.
     pub prefetch_lo_wrong: u64,
@@ -136,7 +138,7 @@ pub struct Stats {
 impl Model {
     /// `cache_gb` is the RAM for experts; `lo_frac` of it holds codebook
     /// copies when the pack has them (0 disables the two-resolution mode).
-    pub fn load(pack: &Path, cache_gb: f64, lo_frac: f64, bias: f32, threads: usize) -> Res<Self> {
+    pub fn load(pack: &Path, cache_gb: f64, lo_frac: f64, lo_all: bool, bias: f32, threads: usize) -> Res<Self> {
         let cfg = Config::load(pack)?;
         let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts.json"))?)?;
         let hi_bytes = meta["slot_bytes"].as_u64().ok_or("experts.json: slot_bytes")? as usize;
@@ -156,7 +158,8 @@ impl Model {
         let store = Store::open(
             pack,
             cfg.layers * cap_hi + cfg.experts + cfg.top_k,
-            if tiered { cfg.layers * cap_lo + 2 * cfg.top_k } else { 0 },
+            // With every pick in codebook, a prefill may read all experts.
+            if tiered { cfg.layers * cap_lo + 2 * cfg.top_k + if lo_all { cfg.experts } else { 0 } } else { 0 },
             threads,
         )?;
         let codebooks = if tiered {
@@ -203,7 +206,8 @@ impl Model {
             prefetch: true,
             tiered,
             skip_last_miss: tiered,
-            lo_all: false,
+            lo_all: lo_all && tiered,
+            lo_prefill: false,
             skipped: 0,
             prefetch_lo_wrong: 0,
             codebooks,
@@ -353,7 +357,7 @@ impl Model {
                 rank[j] = r;
             }
         }
-        let need_lo: Vec<bool> = rank.iter().map(|&r| decode && self.needs_lo(r)).collect();
+        let need_lo: Vec<bool> = rank.iter().map(|&r| if decode { self.needs_lo(r) } else { self.tiered && self.lo_all && self.lo_prefill }).collect();
 
         // What serves each pick: a resident copy, a read, or nothing.
         #[derive(Clone, Copy)]
@@ -458,59 +462,81 @@ impl Model {
         };
         let dtype = x.dtype();
         let hidden = x.shape()[2];
-        let out = if !decode {
-            let slot_of: Vec<u32> = serve.iter().map(|s| match s { Serve::Hi(s) => *s as u32, _ => unreachable!() }).collect();
-            let idx = Array::from_slice(&slot_of, inds.shape());
-            let h = ops::expand_dims_axes(x, &[-2, -3])?;
-            let flat = ops::flatten(&idx, None, None)?;
-            let order = argsort_axis(&flat, 0)?;
-            let inv = argsort_axis(&order, 0)?;
-            let hs = ops::flatten(&h, 0, -3)?;
-            let hs = take_axis(&hs, &ops::floor_divide(&order, &Array::from_int(k as i32))?, 0)?;
-            let is = take_axis(&flat, &order, 0)?;
-            let up = qmm(&hs, "up_proj", &is, true)?;
-            let gate = qmm(&hs, "gate_proj", &is, true)?;
+        // Rows served by the q4 arena run through one gather_qmm per
+        // projection (mlx-lm's SwitchGLU math, rows sorted by slot); rows
+        // served by codebook copies through the codebook kernels. Each row's
+        // input is its token's x. Skipped rows contribute a zero vector.
+        let n_rows = picks.len();
+        let x_flat = ops::reshape(x, &[n_tok as i32, hidden])?;
+        let mut hi_rows: Vec<(usize, u32)> = Vec::new();
+        let mut lo_rows: Vec<(usize, u32)> = Vec::new();
+        for (j, s) in serve.iter().enumerate() {
+            match s {
+                Serve::Hi(slot) => hi_rows.push((j, *slot as u32)),
+                Serve::Lo(slot) => lo_rows.push((j, *slot as u32)),
+                _ => {}
+            }
+        }
+        hi_rows.sort_by_key(|&(_, slot)| slot);
+        let mut parts: Vec<Array> = Vec::new();
+        let mut order: Vec<usize> = Vec::new(); // row j of each output row, in order
+        if !hi_rows.is_empty() {
+            let toks: Vec<u32> = hi_rows.iter().map(|&(j, _)| (j / k) as u32).collect();
+            let slots: Vec<u32> = hi_rows.iter().map(|&(_, s)| s).collect();
+            let hs = if n_tok == 1 {
+                ops::expand_dims_axes(x, &[-2, -3])? // [1, 1, 1, 1, hidden], broadcast over the rows
+            } else {
+                ops::expand_dims_axes(&take_axis(&x_flat, &Array::from_slice(&toks, &[toks.len() as i32]), 0)?, &[1])? // [n, 1, hidden]
+            };
+            let is = if n_tok == 1 { Array::from_slice(&slots, &[1, 1, slots.len() as i32]) } else { Array::from_slice(&slots, &[slots.len() as i32]) };
+            let sorted = n_tok > 1 && slots.len() >= 64;
+            let up = qmm(&hs, "up_proj", &is, sorted)?;
+            let gate = qmm(&hs, "gate_proj", &is, sorted)?;
             let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
-            let y = take_axis(&qmm(&act, "down_proj", &is, true)?, &inv, 0)?;
-            let mut shape = idx.shape().to_vec();
-            shape.extend_from_slice(&y.shape()[1..]);
-            let y = ops::squeeze_axes(&ops::reshape(&y, &shape)?, &[-2])?;
-            ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?
+            parts.push(ops::reshape(&qmm(&act, "down_proj", &is, sorted)?, &[slots.len() as i32, hidden])?);
+            order.extend(hi_rows.iter().map(|&(j, _)| j));
+        }
+        if !lo_rows.is_empty() {
+            let lo = self.store.lo.as_ref().unwrap();
+            let toks: Vec<u32> = lo_rows.iter().map(|&(j, _)| (j / k) as u32).collect();
+            let slots: Vec<u32> = lo_rows.iter().map(|&(_, s)| s).collect();
+            let eids = Array::from_slice(&slots, &[slots.len() as i32]);
+            let xr = hadamard(&x_flat.as_type::<f32>()?)?; // [n_tok, hidden]
+            let xr = if n_tok == 1 { xr } else { take_axis(&xr, &Array::from_slice(&toks, &[toks.len() as i32]), 0)? };
+            let [cb_gate, cb_up, cb_down] = &self.codebooks[i];
+            let act = self.kernels.gate_up(
+                &xr, &eids,
+                lo.array("gate_proj.codes"), lo.array("up_proj.codes"),
+                lo.array("gate_proj.scale"), lo.array("up_proj.scale"),
+                cb_gate, cb_up,
+            )?; // [n, inter] f32, silu(gate) * up
+            let ar = hadamard(&act)?;
+            parts.push(self.kernels.qmv(&ar, &eids, lo.array("down_proj.codes"), lo.array("down_proj.scale"), cb_down, dtype)?);
+            order.extend(lo_rows.iter().map(|&(j, _)| j));
+        }
+        let n_skip = serve.iter().filter(|s| matches!(s, Serve::Skip)).count();
+        self.skipped += n_skip as u64;
+        let out = if n_tok == 1 {
+            // One token: weighted sum of the output rows, in `order`.
+            let y_all = if parts.len() == 1 { parts.pop().unwrap() } else { ops::concatenate(&parts, 0)? };
+            let w: Vec<f32> = order.iter().map(|&j| weights[j]).collect();
+            let w = Array::from_slice(&w, &[w.len() as i32, 1]).as_dtype(dtype)?;
+            ops::reshape(&ops::sum_axis(&ops::multiply(&y_all, &w)?, 0, false)?, &[1, 1, hidden])?
         } else {
-            let mut ys: Vec<Array> = Vec::new();
-            let mut ws: Vec<f32> = Vec::new();
-            let hi_slots: Vec<u32> = serve.iter().filter_map(|s| if let Serve::Hi(s) = s { Some(*s as u32) } else { None }).collect();
-            let lo_slots: Vec<u32> = serve.iter().filter_map(|s| if let Serve::Lo(s) = s { Some(*s as u32) } else { None }).collect();
-            if !hi_slots.is_empty() {
-                let idx = Array::from_slice(&hi_slots, &[1, 1, hi_slots.len() as i32]);
-                let h = ops::expand_dims_axes(x, &[-2, -3])?;
-                let up = qmm(&h, "up_proj", &idx, false)?;
-                let gate = qmm(&h, "gate_proj", &idx, false)?;
-                let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
-                let y = qmm(&act, "down_proj", &idx, false)?; // [1, 1, n, 1, hidden]
-                ys.push(ops::reshape(&y, &[hi_slots.len() as i32, hidden])?);
-                ws.extend(serve.iter().zip(&weights).filter(|(s, _)| matches!(s, Serve::Hi(_))).map(|(_, w)| *w));
+            // Several tokens: put the rows back in router order (skipped
+            // picks point at a zero row), then sum each token's k rows.
+            parts.push(ops::zeros_dtype(&[1, hidden], dtype)?);
+            let y_all = ops::concatenate(&parts, 0)?;
+            let zero_row = (n_rows - n_skip) as u32;
+            let mut pos = vec![zero_row; n_rows];
+            for (p, &j) in order.iter().enumerate() {
+                pos[j] = p as u32;
             }
-            if !lo_slots.is_empty() {
-                let lo = self.store.lo.as_ref().unwrap();
-                let n = lo_slots.len() as i32;
-                let eids = Array::from_slice(&lo_slots, &[n]);
-                let xr = hadamard(&ops::reshape(x, &[1, hidden])?.as_type::<f32>()?)?;
-                let [cb_gate, cb_up, cb_down] = &self.codebooks[i];
-                let act = self.kernels.gate_up(
-                    &xr, &eids,
-                    lo.array("gate_proj.codes"), lo.array("up_proj.codes"),
-                    lo.array("gate_proj.scale"), lo.array("up_proj.scale"),
-                    cb_gate, cb_up,
-                )?; // [n, inter] f32, silu(gate) * up
-                let ar = hadamard(&act)?;
-                ys.push(self.kernels.qmv(&ar, &eids, lo.array("down_proj.codes"), lo.array("down_proj.scale"), cb_down, dtype)?); // [n, hidden]
-                ws.extend(serve.iter().zip(&weights).filter(|(s, _)| matches!(s, Serve::Lo(_))).map(|(_, w)| *w));
-            }
-            self.skipped += serve.iter().filter(|s| matches!(s, Serve::Skip)).count() as u64;
-            let y = if ys.len() == 1 { ys.pop().unwrap() } else { ops::concatenate(&ys, 0)? };
-            let w = Array::from_slice(&ws, &[ws.len() as i32, 1]).as_dtype(dtype)?;
-            ops::reshape(&ops::sum_axis(&ops::multiply(&y, &w)?, 0, false)?, &[1, 1, hidden])?
+            let y = take_axis(&y_all, &Array::from_slice(&pos, &[n_rows as i32]), 0)?;
+            let w: Vec<f32> = serve.iter().zip(&weights).map(|(s, w)| if matches!(s, Serve::Skip) { 0.0 } else { *w }).collect();
+            let w = Array::from_slice(&w, &[n_tok as i32, k as i32, 1]).as_dtype(dtype)?;
+            let y = ops::reshape(&y, &[n_tok as i32, k as i32, hidden])?;
+            ops::reshape(&ops::sum_axis(&ops::multiply(&y, &w)?, 1, false)?, &[1, n_tok as i32, hidden])?
         };
 
         let gone = self.layers[i].cache.update(&uses, fetched);
