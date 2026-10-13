@@ -496,16 +496,15 @@ impl Model {
                 let n = lo_slots.len() as i32;
                 let eids = Array::from_slice(&lo_slots, &[n]);
                 let xr = hadamard(&ops::reshape(x, &[1, hidden])?.as_type::<f32>()?)?;
-                let xr = ops::broadcast_to(&xr, &[n, hidden])?;
                 let [cb_gate, cb_up, cb_down] = &self.codebooks[i];
-                let mut cbq = |xin: &Array, part: &str, cb: &Array| -> Res<Array> {
-                    self.kernels.qmv(xin, &eids, lo.array(&format!("{part}.codes")), lo.array(&format!("{part}.scale")), cb, dtype)
-                };
-                let gate = cbq(&xr, "gate_proj", cb_gate)?;
-                let up = cbq(&xr, "up_proj", cb_up)?;
-                let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
-                let ar = hadamard(&act.as_type::<f32>()?)?;
-                ys.push(cbq(&ar, "down_proj", cb_down)?); // [n, hidden]
+                let act = self.kernels.gate_up(
+                    &xr, &eids,
+                    lo.array("gate_proj.codes"), lo.array("up_proj.codes"),
+                    lo.array("gate_proj.scale"), lo.array("up_proj.scale"),
+                    cb_gate, cb_up,
+                )?; // [n, inter] f32, silu(gate) * up
+                let ar = hadamard(&act)?;
+                ys.push(self.kernels.qmv(&ar, &eids, lo.array("down_proj.codes"), lo.array("down_proj.scale"), cb_down, dtype)?); // [n, hidden]
                 ws.extend(serve.iter().zip(&weights).filter(|(s, _)| matches!(s, Serve::Lo(_))).map(|(_, w)| *w));
             }
             self.skipped += serve.iter().filter(|s| matches!(s, Serve::Skip)).count() as u64;

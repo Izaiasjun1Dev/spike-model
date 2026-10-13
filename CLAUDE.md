@@ -31,8 +31,9 @@ lendo os experts do SSD sob demanda. Há quatro partes:
   (`engine/packlo.py`, cópias em codebook de 2,5 bits) há uma segunda arena
   e um kernel Metal próprio (`cbkernel.rs`). No 235B com 6 GB de cache (pico
   de 12 GB), `--bias 1`: só q4 3,3 tok/s; duas resoluções 3,4; `--lo-all`
-  (tudo em codebook, ppl ×1,14) 5,8; com 10 GB, 7,0. Duas resoluções e bias
-  disputam os mesmos picks de menor peso, e o bias ganha.
+  (tudo em codebook, ppl ×1,14) 6,3; com 10 GB, 9,0. Duas resoluções e bias
+  disputam os mesmos picks de menor peso, e o bias ganha. Cada `eval` custa
+  um piso de ~0,16 ms (uma sync por camada = ~15 ms/token, inevitável).
 
 O README.md e o `tools/routing-trace/README.md` guardam os resultados de cada
 experimento. Quando um experimento novo terminar, acrescente os números lá, no
@@ -187,9 +188,10 @@ Não funcionou (não repita do mesmo jeito):
   tok/s cai (4,67→4,41 com 20% de cache). Com pouca RAM, só rende o que
   reduz os bytes lidos por token.
 
-Próximo passo no motor: custo de GPU por camada (~1 ms, agora a maior
-parcela no modo `--lo-all`), e um codebook melhor (d8/k65536, ou ajuste fino
-dos codebooks) para o modo tudo-em-codebook custar menos que ×1,14.
+Próximo passo no motor: um codebook melhor (d8/k65536, ou ajuste fino dos
+codebooks) para o modo tudo-em-codebook custar menos que ×1,14; prefill em
+codebook (hoje lê o modelo inteiro em q4); e o custo de GPU por camada
+restante (~0,7 ms, dos quais 0,16 é a sync).
 Depois: ajuste fino só do roteador para chegar ao acerto do `bias1`
 (~83% com 16 GB) com perda perto de ×1,02, o que daria ~6,4 tok/s com
 qualidade melhor que a do design atual. É o candidato a treino em escala (com

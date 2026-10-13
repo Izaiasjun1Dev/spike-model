@@ -265,8 +265,10 @@ Qwen3-235B, 6 GB de cache (pico de ~12 GB), 100 tokens:
 | só q4 | 1 | 33,6% | 5,0 | 201 | 98 | 3,27 |
 | duas resoluções | 1 | 33,9% | 4,5 | 181 | 103 | 3,41 |
 | **`--lo-all`, cache todo em codebook** | 0,5 | 39,8% | 2,7 | 81 | 100 | 5,20 |
-| **`--lo-all`, cache todo em codebook** | **1** | 45,0% | 2,4 | 65 | 98 | **5,82** |
+| `--lo-all`, cache todo em codebook | 1 | 45,0% | 2,4 | 65 | 98 | 5,82 |
+| **`--lo-all`, kernel otimizado** | **1** | 44,5% | 2,4 | 84 | **68** | **6,29** |
 | `--lo-all`, 10 GB de cache (pico 15,5 GB) | 1 | 53,5% | 1,8 | 40 | 95 | 7,00 |
+| **`--lo-all`, 10 GB, kernel otimizado** | **1** | 54,4% | 1,7 | 48 | **56** | **9,04** |
 
 As duas resoluções rendem o que o replay previa quando o roteador é o
 original (+26% com bias 0), mas quase nada com `bias 1` (+4%): o bias puxa
@@ -274,8 +276,18 @@ os picks de menor peso para os experts residentes, então os misses que
 sobram são os de maior peso, que exigem q4. As duas técnicas disputam os
 mesmos picks, e o bias ganha. Com todos os picks em codebook, os bytes por
 token caem a 0,56 e o tok/s em 6 GB vai de 3,27 para 5,82 (×1,8), ao custo
-de perplexidade ×1,14 (mais o do bias). Nesse ponto a GPU volta a ser a
-maior parcela (98 contra 65 ms), e a próxima alavanca é o custo por camada.
+de perplexidade ×1,14 (mais o do bias).
+
+Um micro-benchmark de uma camada do 235B (`eval` por camada, como o motor)
+mostrou que a sincronização custa um piso de ~0,16 ms por `eval`, o resto é
+GPU de verdade, e a primeira versão do kernel do codebook era a maior parte
+(~0,11 ms por chamada, contra ~0,02 do `gather_qmm`). O kernel otimizado
+decodifica 4 grupos por lane e iteração (5 bytes de índices, `float4` da
+ativação), guarda o codebook como `half4`, usa 8 linhas por threadgroup, e
+um kernel fundido faz gate e up na mesma passada e já aplica `silu(gate)·up`:
+456 → 94 µs por chamada (gate+up fundido: 133 µs). A GPU caiu de 98 para 68
+ms por token, e o tok/s em 6 GB foi a 6,29 (9,04 em 10 GB). A leitura volta a
+ser a maior parcela em 6 GB.
 
 ## Parâmetros
 
