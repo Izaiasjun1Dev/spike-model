@@ -1,11 +1,12 @@
 //! moe-run: chat with a large MoE model whose experts stay on the SSD.
 //!
 //!   moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5]
-//!           [--max-tokens 512] [--threads 16] [--no-prefetch] [--dump-logits FILE]
+//!           [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--no-prefetch] [--dump-logits FILE]
 //!           [--score IDS_FILE --n-prompt N --dump-logits FILE]   (teacher forcing, for tests)
 //!
 //! <pack> is a directory written by engine/pack.py.
 
+mod cbkernel;
 mod experts;
 mod model;
 
@@ -23,29 +24,35 @@ struct Args {
     prompt: Option<String>,
     chat: bool,
     cache_gb: f64,
+    lo_frac: f64,
     bias: f32,
     max_tokens: usize,
     threads: usize,
     dump_logits: Option<PathBuf>,
     prefetch: bool,
+    tiered: bool,
+    skip_last: bool,
     /// Teacher forcing: a file of u32 token ids, and how many form the prompt.
     score: Option<PathBuf>,
     n_prompt: usize,
 }
 
 fn parse_args() -> Res<Args> {
-    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--no-prefetch] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
+    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--no-prefetch] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         pack: PathBuf::new(),
         prompt: None,
         chat: false,
         cache_gb: 8.0,
+        lo_frac: 0.4,
         bias: 0.5,
         max_tokens: 512,
         threads: 16,
         dump_logits: None,
         prefetch: true,
+        tiered: true,
+        skip_last: true,
         score: None,
         n_prompt: 0,
     };
@@ -61,6 +68,9 @@ fn parse_args() -> Res<Args> {
             "--threads" => a.threads = val()?.parse()?,
             "--dump-logits" => a.dump_logits = Some(val()?.into()),
             "--no-prefetch" => a.prefetch = false,
+            "--lo-frac" => a.lo_frac = val()?.parse()?,
+            "--no-tiered" => a.tiered = false,
+            "--no-skip-last" => a.skip_last = false,
             "--score" => a.score = Some(val()?.into()),
             "--n-prompt" => a.n_prompt = val()?.parse()?,
             "-h" | "--help" => return Err(usage.into()),
@@ -132,13 +142,15 @@ fn reply(model: &mut Model, tok: &Tokenizer, kv: &mut KvCache, text: &str, args:
     }
     let s = model.stats();
     println!(
-        "\n\n[prompt {} tok, {:.1} tok/s | gen {} tok, {:.2} tok/s | hit {:.1}% | read {:.1} GB | prefetch {}/{} used | peak MLX {:.1} GB, RSS {:.1} GB]",
+        "\n\n[prompt {} tok, {:.1} tok/s | gen {} tok, {:.2} tok/s | hit {:.1}% | read {:.1} GB ({} codebook reads, {} skipped) | prefetch {}/{} used | peak MLX {:.1} GB, RSS {:.1} GB]",
         prompt.len(),
         prompt.len() as f64 / t_prefill,
         out.len(),
         out.len() as f64 / t_gen.max(1e-9),
         100.0 * s.hit,
         (model.store.bytes_read - read0) as f64 / 1e9,
+        model.store.lo_reads,
+        model.skipped,
         model.store.prefetch_used,
         model.store.prefetched,
         mlx_rs::memory::peak_memory()? as f64 / 1e9,
@@ -160,14 +172,18 @@ fn run() -> Res<()> {
     mlx_rs::memory::set_cache_limit(512 << 20)?;
     let t0 = Instant::now();
     let tok = Tokenizer::from_file(args.pack.join("tokenizer.json")).map_err(|e| e.to_string())?;
-    let mut model = Model::load(&args.pack, args.cache_gb, args.bias, args.threads)?;
+    let mut model = Model::load(&args.pack, args.cache_gb, if args.tiered { args.lo_frac } else { 0.0 }, args.bias, args.threads)?;
     model.prefetch = args.prefetch;
+    model.skip_last_miss = args.skip_last && model.tiered;
+    let st = model.stats();
     eprintln!(
-        "[loaded in {:.1}s, {} experts cached per layer, arena {:.1} GB, bias {}]\n",
+        "[loaded in {:.1}s, {} q4 + {} codebook experts cached per layer, arenas {:.1} GB, bias {}{}]\n",
         t0.elapsed().as_secs_f64(),
-        model.stats().slots,
-        model.stats().arena_gb,
-        args.bias
+        st.cap_hi,
+        st.cap_lo,
+        st.arena_gb,
+        args.bias,
+        if model.tiered { if model.skip_last_miss { ", tiered + skip last miss" } else { ", tiered" } } else { "" }
     );
     let mut kv = model.new_cache();
     if let Some(path) = &args.score {

@@ -9,6 +9,7 @@ use mlx_rs::ops::indexing::{argmax_axis, take_along_axis, take_axis};
 use mlx_rs::ops::{self, argpartition_axis, argsort_axis};
 use mlx_rs::Array;
 
+use crate::cbkernel::{hadamard, Kernels};
 use crate::experts::{LayerCache, Pending, Res, Store};
 
 pub struct Config {
@@ -105,30 +106,67 @@ pub struct Model {
     /// While layer l runs, read the experts layer l+1's router picks on
     /// layer l's input (pre-gating), so the SSD works while the GPU does.
     pub prefetch: bool,
-    /// Prefetches in flight, per layer.
-    pending: Vec<HashMap<usize, Pending>>,
+    /// Serve the lowest-weight half of a token's picks from the codebook
+    /// copy when the q4 copy is not resident (needs experts_lo.bin).
+    pub tiered: bool,
+    /// Drop the lowest-weight pick when it is a miss (no read, no compute).
+    pub skip_last_miss: bool,
+    pub skipped: u64,
+    /// Prefetches in flight, per layer, keyed by (expert, lo copy?).
+    pending: Vec<HashMap<(usize, bool), Pending>>,
+    /// Codebooks per layer: [gate, up, down], each [K, D] f16.
+    codebooks: Vec<[Array; 3]>,
+    kernels: Kernels,
 }
 
 pub struct Stats {
     pub hit: f64,
     pub gb_read: f64,
-    /// Experts cached per layer.
-    pub slots: usize,
-    /// RAM held by the expert arena.
+    /// q4 and codebook experts cached per layer.
+    pub cap_hi: usize,
+    pub cap_lo: usize,
+    /// RAM held by the expert arenas.
     pub arena_gb: f64,
 }
 
 impl Model {
-    pub fn load(pack: &Path, cache_gb: f64, bias: f32, threads: usize) -> Res<Self> {
+    /// `cache_gb` is the RAM for experts; `lo_frac` of it holds codebook
+    /// copies when the pack has them (0 disables the two-resolution mode).
+    pub fn load(pack: &Path, cache_gb: f64, lo_frac: f64, bias: f32, threads: usize) -> Res<Self> {
         let cfg = Config::load(pack)?;
         let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts.json"))?)?;
-        let slot_bytes = meta["slot_bytes"].as_u64().ok_or("experts.json: slot_bytes")? as usize;
-        let cap = (((cache_gb * 1e9) / (cfg.layers * slot_bytes) as f64) as usize).min(cfg.experts);
-        // Besides the caches, the arena needs room for one layer's misses in
-        // a prefill (up to every expert) and the next layer's prefetches.
-        let store = Store::open(pack, cfg.layers * cap + cfg.experts + cfg.top_k, threads)?;
+        let hi_bytes = meta["slot_bytes"].as_u64().ok_or("experts.json: slot_bytes")? as usize;
+        let tiered = lo_frac > 0.0 && pack.join("experts_lo.bin").exists();
+        let lo_bytes = if tiered {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts_lo.json"))?)?;
+            m["slot_bytes"].as_u64().ok_or("experts_lo.json: slot_bytes")? as usize
+        } else {
+            0
+        };
+        let lo_frac = if tiered { lo_frac } else { 0.0 };
+        let per_layer = cache_gb * 1e9 / cfg.layers as f64;
+        let cap_hi = ((per_layer * (1.0 - lo_frac)) as usize / hi_bytes).min(cfg.experts);
+        let cap_lo = if tiered { ((per_layer * lo_frac) as usize / lo_bytes).min(cfg.experts) } else { 0 };
+        // Besides the caches, the arenas need room for one layer's misses in
+        // a prefill (up to every expert, q4) and the next layer's prefetches.
+        let store = Store::open(
+            pack,
+            cfg.layers * cap_hi + cfg.experts + cfg.top_k,
+            if tiered { cfg.layers * cap_lo + 2 * cfg.top_k } else { 0 },
+            threads,
+        )?;
+        let codebooks = if tiered {
+            let cb = Array::load_safetensors(pack.join("codebooks.safetensors"))?;
+            (0..cfg.layers)
+                .map(|l| -> Res<[Array; 3]> {
+                    let get = |p: &str| cb.get(&format!("layers.{l}.{p}")).cloned().ok_or_else(|| format!("missing codebook layers.{l}.{p}"));
+                    Ok([get("gate_proj")?, get("up_proj")?, get("down_proj")?])
+                })
+                .collect::<Res<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let mut w = Array::load_safetensors(pack.join("model.safetensors"))?;
-        let slots = cap;
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
             let p = format!("model.layers.{i}");
@@ -145,20 +183,25 @@ impl Model {
                 v: QLinear::take(&mut w, &format!("{p}.self_attn.v_proj"))?,
                 o: QLinear::take(&mut w, &format!("{p}.self_attn.o_proj"))?,
                 gate: QLinear::take(&mut w, &format!("{p}.mlp.gate"))?,
-                cache: LayerCache::new(cfg.experts, slots),
+                cache: LayerCache::new(cfg.experts, cap_hi, cap_lo),
             });
         }
         let model = Self {
             embed: QLinear::take(&mut w, "model.embed_tokens")?,
             lm_head: QLinear::take(&mut w, "lm_head")?,
             norm: w.remove("model.norm.weight").ok_or("missing model.norm")?,
+            pending: (0..cfg.layers).map(|_| HashMap::new()).collect(),
             layers,
             cfg,
             store,
             bias,
             t_sync: Default::default(),
-            prefetch: false,
-            pending: Vec::new(),
+            prefetch: true,
+            tiered,
+            skip_last_miss: tiered,
+            skipped: 0,
+            codebooks,
+            kernels: Kernels::new(),
         };
         if let Some(k) = w.keys().next() {
             return Err(format!("unused weight {k}: model.safetensors is not a Qwen3-MoE pack?").into());
@@ -172,11 +215,13 @@ impl Model {
 
     pub fn stats(&self) -> Stats {
         let (hits, lookups) = self.layers.iter().fold((0, 0), |(h, l), x| (h + x.cache.hits, l + x.cache.lookups));
+        let lo_gb = self.store.lo.as_ref().map_or(0.0, |a| (a.slots * a.slot_bytes) as f64 / 1e9);
         Stats {
             hit: hits as f64 / lookups.max(1) as f64,
             gb_read: self.store.bytes_read as f64 / 1e9,
-            slots: self.layers[0].cache.cap,
-            arena_gb: (self.store.slots * self.store.slot) as f64 / 1e9,
+            cap_hi: self.layers[0].cache.cap_hi,
+            cap_lo: self.layers[0].cache.cap_lo,
+            arena_gb: (self.store.hi.slots * self.store.hi.slot_bytes) as f64 / 1e9 + lo_gb,
         }
     }
 
@@ -231,17 +276,18 @@ impl Model {
         l.o.forward(&o, cfg)
     }
 
-    /// Routed experts: route, read the misses, run the needed experts.
     /// Router of `layer` on `x`, biased toward that layer's resident experts:
-    /// (gates, top-k indices).
-    fn route(&self, layer: usize, x: &Array) -> Res<(Array, Array)> {
+    /// (gates, top-k indices, their weights).
+    fn route(&self, layer: usize, x: &Array) -> Res<(Array, Array, Array)> {
         let k = self.cfg.top_k as i32;
         let n_exp = self.cfg.experts as i32;
         let gates = ops::softmax_axis(self.layers[layer].gate.forward(x, &self.cfg)?, -1, true)?;
         let sel = if self.bias != 0.0 {
             let mut res = vec![0f32; self.cfg.experts];
-            for e in self.layers[layer].cache.experts.keys() {
-                res[*e] = self.bias;
+            for e in 0..self.cfg.experts {
+                if self.layers[layer].cache.resident(e) {
+                    res[e] = self.bias;
+                }
             }
             let res = Array::from_slice(&res, &[n_exp]);
             ops::add(&ops::log(&gates.as_type::<f32>()?)?, &res)?
@@ -250,73 +296,124 @@ impl Model {
         };
         let top = Array::from_iter(n_exp - k..n_exp, &[k]);
         let inds = take_axis(argpartition_axis(&sel, -k, -1)?, &top, -1)?;
-        Ok((gates, inds))
-    }
-
-    /// Routed experts: route, read the misses, run the needed experts.
-    fn moe(&mut self, i: usize, x: &Array) -> Res<Array> {
-        let k = self.cfg.top_k as i32;
-        let (gates, inds) = self.route(i, x)?;
         let mut scores = take_along_axis(&gates, &inds, -1)?;
         if self.cfg.norm_topk {
             scores = ops::divide(&scores, &ops::sum_axis(&scores, -1, true)?)?;
         }
+        Ok((gates, inds, scores))
+    }
+
+    /// Which copy a pick needs: the q4 one for the top half by weight, the
+    /// codebook one for the rest (any resident copy serves those).
+    fn needs_lo(&self, rank: usize) -> bool {
+        self.tiered && rank >= self.cfg.top_k / 2
+    }
+
+    /// Routed experts: route, read the misses, run the needed experts.
+    fn moe(&mut self, i: usize, x: &Array) -> Res<Array> {
+        let k = self.cfg.top_k;
+        let n_tok = x.shape()[1] as usize;
+        let decode = n_tok == 1;
+        let (_, inds, scores) = self.route(i, x)?;
 
         // The one sync per layer: which experts does this call need? In decode
         // it also yields the guess for the next layer.
         // take_axis leaves a strided view; flatten copies it to read on the CPU.
         let flat = ops::flatten(&inds, None, None)?;
-        let guess = if self.prefetch && x.shape()[1] == 1 && i + 1 < self.layers.len() {
-            Some(ops::flatten(&self.route(i + 1, x)?.1, None, None)?)
+        let flat_w = ops::flatten(&scores.as_type::<f32>()?, None, None)?;
+        let guess = if self.prefetch && decode && i + 1 < self.layers.len() {
+            let (_, gi, gw) = self.route(i + 1, x)?;
+            Some((ops::flatten(&gi, None, None)?, ops::flatten(&gw.as_type::<f32>()?, None, None)?))
         } else {
             None
         };
         let t0 = std::time::Instant::now();
-        mlx_rs::transforms::eval(std::iter::once(&flat).chain(guess.iter()))?;
+        let mut to_eval = vec![&flat, &flat_w];
+        if let Some((gi, gw)) = &guess {
+            to_eval.extend([gi, gw]);
+        }
+        mlx_rs::transforms::eval(to_eval)?;
         self.t_sync += t0.elapsed();
-        let picks: Vec<u32> = flat.as_slice::<u32>().to_vec();
-        let mut counts: Vec<(usize, usize)> = Vec::new();
-        let mut sorted = picks.clone();
-        sorted.sort_unstable();
-        for &p in &sorted {
-            match counts.last_mut() {
-                Some((e, c)) if *e == p as usize => *c += 1,
-                _ => counts.push((p as usize, 1)),
+        let picks: Vec<usize> = flat.as_slice::<u32>().iter().map(|&p| p as usize).collect();
+        let weights: Vec<f32> = flat_w.as_slice::<f32>().to_vec();
+
+        // Rank of each pick within its token (0 = highest weight), and the
+        // copy it needs. Prefills use q4 for everything.
+        let mut rank = vec![0usize; picks.len()];
+        for t in 0..n_tok {
+            let mut order: Vec<usize> = (t * k..(t + 1) * k).collect();
+            order.sort_by(|a, b| weights[*b].total_cmp(&weights[*a]));
+            for (r, &j) in order.iter().enumerate() {
+                rank[j] = r;
             }
+        }
+        let need_lo: Vec<bool> = rank.iter().map(|&r| decode && self.needs_lo(r)).collect();
+
+        // What serves each pick: a resident copy, a read, or nothing.
+        #[derive(Clone, Copy)]
+        enum Serve {
+            Hi(usize),
+            Lo(usize),
+            Read(bool),
+            Skip,
         }
         let cache = &mut self.layers[i].cache;
         cache.lookups += picks.len() as u64;
-        let missing: Vec<usize> = counts.iter().map(|&(e, _)| e).filter(|e| !cache.experts.contains_key(e)).collect();
-        cache.hits += counts.iter().filter(|(e, _)| cache.experts.contains_key(e)).map(|&(_, c)| c as u64).sum::<u64>();
+        let mut serve = Vec::with_capacity(picks.len());
+        let mut uses: HashMap<(usize, bool), usize> = HashMap::new();
+        for (j, &e) in picks.iter().enumerate() {
+            *uses.entry((e, !need_lo[j])).or_default() += 1;
+            let s = match (cache.hi.get(&e), cache.lo.get(&e), need_lo[j]) {
+                (Some(&s), _, _) => Serve::Hi(s),
+                (None, Some(&s), true) => Serve::Lo(s),
+                _ if decode && self.skip_last_miss && rank[j] == k - 1
+                    && !self.pending[i].contains_key(&(e, false)) && !self.pending[i].contains_key(&(e, need_lo[j])) => Serve::Skip,
+                _ => Serve::Read(need_lo[j]),
+            };
+            if matches!(s, Serve::Hi(_) | Serve::Lo(_)) {
+                cache.hits += 1;
+            }
+            serve.push(s);
+        }
+        let mut uses: Vec<(usize, bool, usize)> = uses.into_iter().map(|((e, high), c)| (e, high, c)).collect();
+        uses.sort_unstable();
 
         // Misses: take over a prefetch already under way, else read on demand.
-        if self.pending.len() < self.layers.len() {
-            self.pending = (0..self.layers.len()).map(|_| HashMap::new()).collect();
-        }
-        let mut reads = Vec::with_capacity(missing.len());
-        for &e in &missing {
-            match self.pending[i].remove(&e) {
+        let mut reads: HashMap<(usize, bool), Pending> = HashMap::new();
+        for (j, &e) in picks.iter().enumerate() {
+            let Serve::Read(lo) = serve[j] else { continue };
+            if reads.contains_key(&(e, lo)) || (lo && reads.contains_key(&(e, false))) {
+                continue;
+            }
+            // A pending q4 copy serves a low pick too.
+            let key = if self.pending[i].contains_key(&(e, lo)) { (e, lo) } else { (e, false) };
+            match self.pending[i].remove(&key) {
                 Some(p) => {
                     self.store.promote(&p);
                     self.store.prefetch_used += 1;
-                    reads.push((e, p));
+                    reads.insert(key, p);
                 }
                 None => {
-                    let p = self.store.start(i, e, true)?.ok_or("expert arena full")?;
-                    reads.push((e, p));
+                    let p = self.store.start(i, e, lo, true)?.ok_or("expert arena full")?;
+                    reads.insert((e, lo), p);
                 }
             }
         }
         let stale: Vec<Pending> = self.pending[i].drain().map(|(_, p)| p).collect();
         // Queue the guesses for the next layer behind the demand reads.
-        if let Some(g) = &guess {
-            let mut want: Vec<usize> = g.as_slice::<u32>().iter().map(|&e| e as usize).collect();
-            want.sort_unstable();
-            want.dedup();
-            for e in want {
-                if !self.layers[i + 1].cache.experts.contains_key(&e) && !self.pending[i + 1].contains_key(&e) {
-                    if let Some(p) = self.store.start(i + 1, e, false)? {
-                        self.pending[i + 1].insert(e, p);
+        if let Some((gi, gw)) = &guess {
+            let g: Vec<usize> = gi.as_slice::<u32>().iter().map(|&e| e as usize).collect();
+            let w = gw.as_slice::<f32>();
+            let mut order: Vec<usize> = (0..g.len()).collect();
+            order.sort_by(|a, b| w[*b].total_cmp(&w[*a]));
+            let next = &self.layers[i + 1].cache;
+            for (r, &j) in order.iter().enumerate() {
+                let (e, lo) = (g[j], self.needs_lo(r));
+                let served = next.hi.contains_key(&e) || (lo && next.lo.contains_key(&e));
+                let queued = self.pending[i + 1].contains_key(&(e, false)) || (lo && self.pending[i + 1].contains_key(&(e, true)));
+                if !served && !queued {
+                    if let Some(p) = self.store.start(i + 1, e, lo, false)? {
+                        self.pending[i + 1].insert((e, lo), p);
                     }
                 }
             }
@@ -324,32 +421,40 @@ impl Model {
         for p in stale {
             self.store.discard(p)?;
         }
-        let fetched: HashMap<usize, usize> =
-            reads.into_iter().map(|(e, p)| Ok((e, self.store.finish(p)?))).collect::<Res<_>>()?;
+        let mut reads: Vec<((usize, bool), Pending)> = reads.into_iter().collect();
+        reads.sort_by_key(|(k, _)| *k);
+        let mut fetched: Vec<(usize, bool, usize)> = Vec::new();
+        for ((e, lo), p) in reads {
+            let slot = self.store.finish(p)?;
+            fetched.push((e, lo, slot));
+        }
+        for (j, &e) in picks.iter().enumerate() {
+            if let Serve::Read(lo) = serve[j] {
+                let f = fetched.iter().find(|f| f.0 == e && (!f.1 || lo)).unwrap();
+                serve[j] = if f.1 { Serve::Lo(f.2) } else { Serve::Hi(f.2) };
+            }
+        }
 
-        // Every pick is now in the arena: run the experts with one gather_qmm
-        // per projection, indexed by slot (same math as mlx-lm's SwitchGLU,
-        // including its sort for many tokens).
-        let cache = &self.layers[i].cache;
-        let slot_of: Vec<u32> = picks
-            .iter()
-            .map(|&p| *cache.experts.get(&(p as usize)).or_else(|| fetched.get(&(p as usize))).unwrap() as u32)
-            .collect();
-        let idx = Array::from_slice(&slot_of, inds.shape());
+        // Run the picks served by the q4 arena with one gather_qmm per
+        // projection (same math as mlx-lm's SwitchGLU, including its sort for
+        // many tokens), and the rest with the codebook kernel.
         let (gs, bits) = (self.store.group_size, self.store.bits);
-        let arena = &self.store.arena;
+        let hi = &self.store.hi;
         let qmm = |h: &Array, part: &str, idx: &Array, sorted: bool| -> Res<Array> {
-            let t = |n: &str| &arena[self.store.part(&format!("{part}.{n}"))];
+            let t = |n: &str| hi.array(&format!("{part}.{n}"));
             Ok(ops::gather_qmm(h, t("weight"), t("scales"), t("biases"), None, idx, true, gs, bits, sorted)?)
         };
-        let h = ops::expand_dims_axes(x, &[-2, -3])?;
-        let sort = idx.size() >= 64;
-        let y = if sort {
+        let dtype = x.dtype();
+        let hidden = x.shape()[2];
+        let out = if !decode {
+            let slot_of: Vec<u32> = serve.iter().map(|s| match s { Serve::Hi(s) => *s as u32, _ => unreachable!() }).collect();
+            let idx = Array::from_slice(&slot_of, inds.shape());
+            let h = ops::expand_dims_axes(x, &[-2, -3])?;
             let flat = ops::flatten(&idx, None, None)?;
             let order = argsort_axis(&flat, 0)?;
             let inv = argsort_axis(&order, 0)?;
             let hs = ops::flatten(&h, 0, -3)?;
-            let hs = take_axis(&hs, &ops::floor_divide(&order, &Array::from_int(k))?, 0)?;
+            let hs = take_axis(&hs, &ops::floor_divide(&order, &Array::from_int(k as i32))?, 0)?;
             let is = take_axis(&flat, &order, 0)?;
             let up = qmm(&hs, "up_proj", &is, true)?;
             let gate = qmm(&hs, "gate_proj", &is, true)?;
@@ -357,18 +462,47 @@ impl Model {
             let y = take_axis(&qmm(&act, "down_proj", &is, true)?, &inv, 0)?;
             let mut shape = idx.shape().to_vec();
             shape.extend_from_slice(&y.shape()[1..]);
-            ops::reshape(&y, &shape)?
+            let y = ops::squeeze_axes(&ops::reshape(&y, &shape)?, &[-2])?;
+            ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?
         } else {
-            let up = qmm(&h, "up_proj", &idx, false)?;
-            let gate = qmm(&h, "gate_proj", &idx, false)?;
-            let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
-            qmm(&act, "down_proj", &idx, false)?
+            let mut ys: Vec<Array> = Vec::new();
+            let mut ws: Vec<f32> = Vec::new();
+            let hi_slots: Vec<u32> = serve.iter().filter_map(|s| if let Serve::Hi(s) = s { Some(*s as u32) } else { None }).collect();
+            let lo_slots: Vec<u32> = serve.iter().filter_map(|s| if let Serve::Lo(s) = s { Some(*s as u32) } else { None }).collect();
+            if !hi_slots.is_empty() {
+                let idx = Array::from_slice(&hi_slots, &[1, 1, hi_slots.len() as i32]);
+                let h = ops::expand_dims_axes(x, &[-2, -3])?;
+                let up = qmm(&h, "up_proj", &idx, false)?;
+                let gate = qmm(&h, "gate_proj", &idx, false)?;
+                let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
+                let y = qmm(&act, "down_proj", &idx, false)?; // [1, 1, n, 1, hidden]
+                ys.push(ops::reshape(&y, &[hi_slots.len() as i32, hidden])?);
+                ws.extend(serve.iter().zip(&weights).filter(|(s, _)| matches!(s, Serve::Hi(_))).map(|(_, w)| *w));
+            }
+            if !lo_slots.is_empty() {
+                let lo = self.store.lo.as_ref().unwrap();
+                let n = lo_slots.len() as i32;
+                let eids = Array::from_slice(&lo_slots, &[n]);
+                let xr = hadamard(&ops::reshape(x, &[1, hidden])?.as_type::<f32>()?)?;
+                let xr = ops::broadcast_to(&xr, &[n, hidden])?;
+                let [cb_gate, cb_up, cb_down] = &self.codebooks[i];
+                let mut cbq = |xin: &Array, part: &str, cb: &Array| -> Res<Array> {
+                    self.kernels.qmv(xin, &eids, lo.array(&format!("{part}.codes")), lo.array(&format!("{part}.scale")), cb, dtype)
+                };
+                let gate = cbq(&xr, "gate_proj", cb_gate)?;
+                let up = cbq(&xr, "up_proj", cb_up)?;
+                let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
+                let ar = hadamard(&act.as_type::<f32>()?)?;
+                ys.push(cbq(&ar, "down_proj", cb_down)?); // [n, hidden]
+                ws.extend(serve.iter().zip(&weights).filter(|(s, _)| matches!(s, Serve::Lo(_))).map(|(_, w)| *w));
+            }
+            self.skipped += serve.iter().filter(|s| matches!(s, Serve::Skip)).count() as u64;
+            let y = if ys.len() == 1 { ys.pop().unwrap() } else { ops::concatenate(&ys, 0)? };
+            let w = Array::from_slice(&ws, &[ws.len() as i32, 1]).as_dtype(dtype)?;
+            ops::reshape(&ops::sum_axis(&ops::multiply(&y, &w)?, 0, false)?, &[1, 1, hidden])?
         };
-        let y = ops::squeeze_axes(&y, &[-2])?;
-        let dtype = y.dtype();
-        let out = ops::sum_axis(&ops::multiply(&y, &ops::expand_dims_axes(&scores, &[-1])?)?, -2, false)?.as_dtype(dtype)?;
 
-        let gone = self.layers[i].cache.update(&counts, fetched);
+        let gone = self.layers[i].cache.update(&uses, fetched);
         self.store.release(gone);
         Ok(out)
     }

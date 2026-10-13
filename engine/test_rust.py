@@ -28,6 +28,8 @@ def main():
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--cache-gb", default="0.5,100")
     ap.add_argument("--extra", default="", help="extra moe-run flags, e.g. '--no-prefetch'")
+    ap.add_argument("--max-kl", type=float, help="pass on KL below this instead of the stock-noise rule "
+                    "(two-resolution mode is expected to cost ~0.02 nats, tools/routing-trace/codebook.py)")
     args = ap.parse_args()
 
     stock, tok = load(args.model)
@@ -59,7 +61,7 @@ def main():
                 lp = lp - np.log(np.exp(lp).sum(-1, keepdims=True))
                 kl = float((np.exp(ref) * (ref - lp)).sum(-1).mean())
                 top1 = float((lp.argmax(-1) == ref.argmax(-1)).mean())
-                passed = kl <= NOISE_FACTOR * noise
+                passed = kl <= (args.max_kl if args.max_kl else NOISE_FACTOR * noise)
                 ok &= passed
                 print(f"cache {cache_gb} GB | {'ok  ' if passed else 'FAIL'} kl {kl:.2e} (stock noise {noise:.2e}) "
                       f"top1 {100 * top1:.1f}% | {p[:40]}")

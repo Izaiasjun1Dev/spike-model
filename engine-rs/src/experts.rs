@@ -1,11 +1,13 @@
-//! Routed experts on the SSD (`experts.bin`, written by engine/pack.py), the
-//! arena that holds some of them in RAM, and the per-layer cache policy.
+//! Routed experts on the SSD, the arenas that hold some of them in RAM, and
+//! the per-layer cache policy.
 //!
-//! The arena is one array per expert tensor (gate/up/down weight, scales,
-//! biases), shaped `[slots, ...]`, shared by every layer. An expert in RAM
-//! occupies the same slot index in all nine arrays, so a layer runs its
-//! experts with one `gather_qmm` per projection, indexed by slot, with no
-//! stacking or copying. Reads go straight from the file into the slot.
+//! Two copies of every expert may exist on disk: `experts.bin` (q4, written
+//! by engine/pack.py) and `experts_lo.bin` (2.5-bit codebook, engine/packlo.py).
+//! Each has an arena: one array per expert tensor, shaped `[slots, ...]`,
+//! shared by every layer. An expert in RAM occupies the same slot index in
+//! all of the arena's arrays, so a layer runs its experts with one kernel
+//! per projection indexed by slot, with no stacking or copying. Reads go
+//! straight from the file into the slot.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -39,6 +41,7 @@ struct Ticket {
 }
 
 struct Job {
+    file: Arc<File>,
     off: u64,
     addr: usize, // destination inside an arena array; usize so it can cross threads
     len: usize,
@@ -59,40 +62,30 @@ struct Pool {
     ready: Condvar,
 }
 
-/// An expert being read into `slot`.
+/// An expert being read into a slot.
 pub struct Pending {
+    pub lo: bool,
     pub slot: usize,
     ticket: Arc<Ticket>,
 }
 
-pub struct Store {
+/// One copy format's file and the RAM arena for it.
+pub struct Arena {
+    file: Arc<File>,
     parts: Vec<Part>,
-    pool: Arc<Pool>,
-    workers: Vec<std::thread::JoinHandle<()>>,
-    /// Arena arrays, one per part, `[slots, ...part.shape]`.
-    pub arena: Vec<Array>,
-    /// Base address of each arena array.
-    arena_ptr: Vec<usize>,
+    /// One array per part, `[slots, ...part.shape]`.
+    pub arrays: Vec<Array>,
+    ptrs: Vec<usize>,
     pub slots: usize,
     free: Vec<usize>,
-    pub slot: usize,
-    pub experts: usize,
-    pub group_size: i32,
-    pub bits: i32,
-    pub bytes_read: u64,
-    pub prefetched: u64,
-    pub prefetch_used: u64,
-    /// Time the caller spent blocked on reads.
-    pub t_io: std::time::Duration,
+    pub slot_bytes: usize,
 }
 
-impl Store {
-    /// Opens the pack with an arena of `slots` experts.
-    pub fn open(pack: &Path, slots: usize, threads: usize) -> Res<Self> {
-        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts.json"))?)?;
+impl Arena {
+    fn open(bin: &Path, meta: &serde_json::Value, slots: usize) -> Res<Self> {
         let parts = meta["tensors"]
             .as_array()
-            .ok_or("experts.json: no tensors")?
+            .ok_or("no tensors in expert metadata")?
             .iter()
             .map(|t| -> Res<Part> {
                 Ok(Part {
@@ -101,6 +94,7 @@ impl Store {
                     nbytes: t["nbytes"].as_u64().ok_or("nbytes")? as usize,
                     shape: t["shape"].as_array().ok_or("shape")?.iter().map(|d| d.as_i64().unwrap() as i32).collect(),
                     dtype: match t["dtype"].as_str().ok_or("dtype")? {
+                        "uint8" => Dtype::Uint8,
                         "uint32" => Dtype::Uint32,
                         "bfloat16" => Dtype::Bfloat16,
                         "float16" => Dtype::Float16,
@@ -110,79 +104,133 @@ impl Store {
                 })
             })
             .collect::<Res<Vec<_>>>()?;
-        let mut arena = Vec::with_capacity(parts.len());
-        let mut arena_ptr = Vec::with_capacity(parts.len());
+        let mut arrays = Vec::with_capacity(parts.len());
+        let mut ptrs = Vec::with_capacity(parts.len());
         for p in &parts {
             let mut shape = vec![slots as i32];
             shape.extend_from_slice(&p.shape);
             let a = ops::zeros_dtype(&shape, p.dtype)?;
             a.eval()?;
             // data<T>() in mlx-c only casts the pointer, whatever the dtype.
-            arena_ptr.push(unsafe { mlx_sys::mlx_array_data_uint8(a.as_ptr()) } as usize);
-            arena.push(a);
+            ptrs.push(unsafe { mlx_sys::mlx_array_data_uint8(a.as_ptr()) } as usize);
+            arrays.push(a);
         }
-        let file = File::open(pack.join("experts.bin"))?;
+        let file = File::open(bin)?;
         // Bypass the page cache: misses really come from the SSD, and the
         // OS does not grow a second copy of the experts in RAM.
         unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-        let file = Arc::new(file);
+        Ok(Self {
+            file: Arc::new(file),
+            parts,
+            arrays,
+            ptrs,
+            slots,
+            free: (0..slots).rev().collect(),
+            slot_bytes: meta["slot_bytes"].as_u64().ok_or("slot_bytes")? as usize,
+        })
+    }
+
+    /// Index of the array holding `name` (e.g. "up_proj.scales").
+    pub fn part(&self, name: &str) -> usize {
+        self.parts.iter().position(|p| p.name == name).unwrap_or_else(|| panic!("no expert tensor {name}"))
+    }
+
+    pub fn array(&self, name: &str) -> &Array {
+        &self.arrays[self.part(name)]
+    }
+}
+
+pub struct Store {
+    pub hi: Arena,
+    pub lo: Option<Arena>,
+    pool: Arc<Pool>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    pub experts: usize,
+    pub group_size: i32,
+    pub bits: i32,
+    pub bytes_read: u64,
+    pub prefetched: u64,
+    pub prefetch_used: u64,
+    pub lo_reads: u64,
+    /// Time the caller spent blocked on reads.
+    pub t_io: std::time::Duration,
+}
+
+impl Store {
+    /// Opens the pack with arenas of `hi_slots` q4 experts and, when the pack
+    /// has codebook copies and `lo_slots` > 0, `lo_slots` of those.
+    pub fn open(pack: &Path, hi_slots: usize, lo_slots: usize, threads: usize) -> Res<Self> {
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts.json"))?)?;
+        let hi = Arena::open(&pack.join("experts.bin"), &meta, hi_slots)?;
+        let lo = if lo_slots > 0 && pack.join("experts_lo.bin").exists() {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts_lo.json"))?)?;
+            Some(Arena::open(&pack.join("experts_lo.bin"), &m, lo_slots)?)
+        } else {
+            None
+        };
         let pool = Arc::new(Pool { q: Mutex::new(Queues::default()), ready: Condvar::new() });
         let workers = (0..threads.max(1))
             .map(|_| {
-                let (pool, file) = (pool.clone(), file.clone());
-                std::thread::spawn(move || worker(&pool, &file))
+                let pool = pool.clone();
+                std::thread::spawn(move || worker(&pool))
             })
             .collect();
         Ok(Self {
-            parts,
+            hi,
+            lo,
             pool,
             workers,
-            arena,
-            arena_ptr,
-            slots,
-            free: (0..slots).rev().collect(),
-            slot: meta["slot_bytes"].as_u64().ok_or("slot_bytes")? as usize,
             experts: meta["experts"].as_u64().ok_or("experts")? as usize,
             group_size: meta["group_size"].as_i64().ok_or("group_size")? as i32,
             bits: meta["bits"].as_i64().ok_or("bits")? as i32,
             bytes_read: 0,
             prefetched: 0,
             prefetch_used: 0,
+            lo_reads: 0,
             t_io: Default::default(),
         })
     }
 
-    /// Index of the arena array holding `name` (e.g. "up_proj.scales").
-    pub fn part(&self, name: &str) -> usize {
-        self.parts.iter().position(|p| p.name == name).unwrap_or_else(|| panic!("no expert tensor {name}"))
+    fn arena_mut(&mut self, lo: bool) -> &mut Arena {
+        if lo { self.lo.as_mut().expect("no low-precision arena") } else { &mut self.hi }
     }
 
-    /// Starts reading an expert into a free slot. Returns None when the arena
-    /// is full (the caller must release slots first).
-    pub fn start(&mut self, layer: usize, expert: usize, demand: bool) -> Res<Option<Pending>> {
-        let Some(slot) = self.free.pop() else { return Ok(None) };
-        let base = ((layer * self.experts + expert) * self.slot) as u64;
+    pub fn arena(&self, lo: bool) -> &Arena {
+        if lo { self.lo.as_ref().expect("no low-precision arena") } else { &self.hi }
+    }
+
+    /// Starts reading an expert's copy into a free slot of its arena. None
+    /// when the arena is full (the caller must release slots first).
+    pub fn start(&mut self, layer: usize, expert: usize, lo: bool, demand: bool) -> Res<Option<Pending>> {
+        let n = self.experts;
+        let a = self.arena_mut(lo);
+        let Some(slot) = a.free.pop() else { return Ok(None) };
+        let base = ((layer * n + expert) * a.slot_bytes) as u64;
         let mut jobs = Vec::new();
-        for (p, &ptr) in self.parts.iter().zip(&self.arena_ptr) {
+        for (p, &ptr) in a.parts.iter().zip(&a.ptrs) {
             let dst = ptr + slot * p.nbytes;
             for j in (0..p.nbytes).step_by(CHUNK) {
                 jobs.push((base + (p.offset + j) as u64, dst + j, CHUNK.min(p.nbytes - j)));
             }
         }
         let ticket = Arc::new(Ticket { left: Mutex::new(jobs.len()), done: Condvar::new(), err: Mutex::new(None) });
+        let (file, slot_bytes) = (a.file.clone(), a.slot_bytes);
         {
             let mut q = self.pool.q.lock().unwrap();
             let dst = if demand { &mut q.demand } else { &mut q.prefetch };
             for (off, addr, len) in jobs {
-                dst.push_back(Job { off, addr, len, ticket: ticket.clone() });
+                dst.push_back(Job { file: file.clone(), off, addr, len, ticket: ticket.clone() });
             }
         }
         self.pool.ready.notify_all();
-        self.bytes_read += self.slot as u64;
+        self.bytes_read += slot_bytes as u64;
+        if lo {
+            self.lo_reads += 1;
+        }
         if !demand {
             self.prefetched += 1;
         }
-        Ok(Some(Pending { slot, ticket }))
+        Ok(Some(Pending { lo, slot, ticket }))
     }
 
     /// A prefetch is needed now: move its queued chunks ahead of the others.
@@ -229,7 +277,7 @@ impl Store {
         *p.ticket.left.lock().unwrap() -= cancelled;
         self.bytes_read -= bytes;
         self.wait_done(&p)?;
-        self.free.push(p.slot);
+        self.arena_mut(p.lo).free.push(p.slot);
         Ok(())
     }
 
@@ -237,16 +285,14 @@ impl Store {
     /// read them has run: callers release at the end of a layer, and the
     /// next `start` happens after the next layer's routing sync, which forces
     /// that work.
-    pub fn release(&mut self, slots: impl IntoIterator<Item = usize>) {
-        self.free.extend(slots);
-    }
-
-    pub fn free_slots(&self) -> usize {
-        self.free.len()
+    pub fn release(&mut self, slots: impl IntoIterator<Item = (bool, usize)>) {
+        for (lo, s) in slots {
+            self.arena_mut(lo).free.push(s);
+        }
     }
 }
 
-fn worker(pool: &Pool, file: &File) {
+fn worker(pool: &Pool) {
     loop {
         let job = {
             let mut q = pool.q.lock().unwrap();
@@ -263,7 +309,7 @@ fn worker(pool: &Pool, file: &File) {
         // Each chunk is written by exactly one worker, and nothing reads the
         // slot until its ticket is done.
         let dst = unsafe { std::slice::from_raw_parts_mut(job.addr as *mut u8, job.len) };
-        if let Err(e) = file.read_exact_at(dst, job.off) {
+        if let Err(e) = job.file.read_exact_at(dst, job.off) {
             *job.ticket.err.lock().unwrap() = Some(format!("read at {}: {e}", job.off));
         }
         let mut left = job.ticket.left.lock().unwrap();
@@ -285,55 +331,98 @@ impl Drop for Store {
 }
 
 /// Per-layer LFU with decay and bypass (the design tools/routing-trace
-/// settled on): `cap` experts stay; scores decay with a half-life of 32
-/// calls, and a newly read expert only enters by beating the weakest
-/// resident one, otherwise it is used for this call and dropped.
+/// settled on), kept separately for the two copy formats: `cap_hi` q4
+/// experts and `cap_lo` codebook ones stay resident. Scores decay with a
+/// half-life of 32 calls; a q4 entry is worth every recent use of the
+/// expert, a codebook entry only its recent low-weight picks (it cannot
+/// serve a high one). A newly read expert only enters by beating the
+/// weakest resident of its format, otherwise it is used once and dropped.
 pub struct LayerCache {
-    pub cap: usize,
+    pub cap_hi: usize,
+    pub cap_lo: usize,
     decay: f64,
-    score: Vec<f64>,
-    /// Resident expert -> arena slot.
-    pub experts: HashMap<usize, usize>,
+    hi_score: Vec<f64>,
+    lo_score: Vec<f64>,
+    at: Vec<u64>,
+    clock: u64,
+    /// Resident expert -> slot in the q4 arena.
+    pub hi: HashMap<usize, usize>,
+    /// Resident expert -> slot in the codebook arena.
+    pub lo: HashMap<usize, usize>,
     pub hits: u64,
     pub lookups: u64,
 }
 
 impl LayerCache {
-    pub fn new(n_experts: usize, cap: usize) -> Self {
+    pub fn new(n_experts: usize, cap_hi: usize, cap_lo: usize) -> Self {
         Self {
-            cap,
+            cap_hi,
+            cap_lo,
             decay: 0.5f64.powf(1.0 / 32.0),
-            score: vec![0.0; n_experts],
-            experts: HashMap::new(),
+            hi_score: vec![0.0; n_experts],
+            lo_score: vec![0.0; n_experts],
+            at: vec![0; n_experts],
+            clock: 0,
+            hi: HashMap::new(),
+            lo: HashMap::new(),
             hits: 0,
             lookups: 0,
         }
     }
 
-    /// counts: uses of each expert in this call; fetched: expert -> slot of
-    /// the experts read for it. Returns the slots that leave (evicted, or
-    /// read and not kept).
-    pub fn update(&mut self, counts: &[(usize, usize)], mut fetched: HashMap<usize, usize>) -> Vec<usize> {
-        for s in self.score.iter_mut() {
-            *s *= self.decay;
+    pub fn resident(&self, e: usize) -> bool {
+        self.hi.contains_key(&e) || self.lo.contains_key(&e)
+    }
+
+    fn scores(&self, e: usize) -> (f64, f64) {
+        let f = self.decay.powi((self.clock - self.at[e]).min(100_000) as i32);
+        (self.hi_score[e] * f, self.lo_score[e] * f)
+    }
+
+    /// uses: (expert, high-weight pick?, count) in this call; fetched:
+    /// (expert, lo copy?, slot) read for it. Returns the slots that leave
+    /// (evicted, replaced, or read and not kept) as (lo, slot).
+    pub fn update(&mut self, uses: &[(usize, bool, usize)], fetched: Vec<(usize, bool, usize)>) -> Vec<(bool, usize)> {
+        self.clock += 1;
+        for &(e, high, c) in uses {
+            let (h, l) = self.scores(e);
+            self.hi_score[e] = h + if high { c as f64 } else { 0.0 };
+            self.lo_score[e] = l + if high { 0.0 } else { c as f64 };
+            self.at[e] = self.clock;
         }
-        for &(e, c) in counts {
-            self.score[e] += c as f64;
-        }
-        if self.cap == 0 {
-            return fetched.into_values().collect();
-        }
-        let mut cand: Vec<usize> = self.experts.keys().chain(fetched.keys()).copied().collect();
-        cand.sort_by(|a, b| self.score[*b].total_cmp(&self.score[*a]));
-        cand.truncate(self.cap);
-        let evicted: Vec<usize> = self.experts.keys().filter(|e| !cand.contains(e)).copied().collect();
-        let mut gone: Vec<usize> = evicted.iter().filter_map(|e| self.experts.remove(e)).collect();
-        for e in cand {
-            if let Some(s) = fetched.remove(&e) {
-                self.experts.insert(e, s);
+        let mut gone = Vec::new();
+        for lo in [false, true] {
+            let new: Vec<(usize, usize)> = fetched.iter().filter(|f| f.1 == lo).map(|f| (f.0, f.2)).collect();
+            if new.is_empty() {
+                continue;
+            }
+            let cap = if lo { self.cap_lo } else { self.cap_hi };
+            let score = |s: &Self, e: usize| {
+                let (h, l) = s.scores(e);
+                if lo { l } else { h + l }
+            };
+            let table = if lo { &self.lo } else { &self.hi };
+            let mut cand: Vec<usize> = table.keys().chain(new.iter().map(|(e, _)| e)).copied().collect();
+            // Ties broken by expert id, so runs are reproducible (HashMap
+            // order is not).
+            cand.sort_by(|a, b| score(self, *b).total_cmp(&score(self, *a)).then(a.cmp(b)));
+            cand.truncate(cap);
+            let table = if lo { &mut self.lo } else { &mut self.hi };
+            let mut evicted: Vec<usize> = table.keys().filter(|e| !cand.contains(e)).copied().collect();
+            evicted.sort_unstable();
+            gone.extend(evicted.iter().filter_map(|e| table.remove(e)).map(|s| (lo, s)));
+            for (e, s) in new {
+                if cand.contains(&e) {
+                    table.insert(e, s);
+                } else {
+                    gone.push((lo, s));
+                }
             }
         }
-        gone.extend(fetched.into_values());
+        // A q4 copy serves everything: drop codebook copies it makes redundant.
+        let mut redundant: Vec<usize> = self.lo.keys().filter(|e| self.hi.contains_key(e)).copied().collect();
+        redundant.sort_unstable();
+        gone.extend(redundant.iter().filter_map(|e| self.lo.remove(e)).map(|s| (true, s)));
         gone
     }
 }
