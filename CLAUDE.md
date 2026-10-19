@@ -28,6 +28,10 @@ lendo os experts do SSD sob demanda. Há quatro partes:
   prefill na ordem dos slots, como o mlx-lm) e, para a arquitetura
   DeepSeek-V3, `uv run test_rust.py ~/packs/moonlight-16b --model
   mlx-community/Moonlight-16B-A3B-Instruct-4-bit --extra=--no-tiered`.
+  Os prompts padrão são curtos; `--long-prompt 800 --cache-gb 0.5,100`
+  cobre o prefill longo, onde o kernel do `gather_qmm` muda (no Moonlight o
+  prompt longo dá KL 1,27e-3, um pouco acima do limite: desvio antigo da
+  arquitetura, não dos experts).
   Texto greedy idêntico não é critério, 1 ulp troca tokens. `model.rs` tem
   `Arch::Qwen3` e `Arch::DeepseekV3` (MLA absorvida como no mlx-lm, roteador
   sigmoid + `e_score_correction_bias`, experts compartilhados, camada 0
@@ -36,9 +40,19 @@ lendo os experts do SSD sob demanda. Há quatro partes:
   chat, list). `MOE_PROFILE=1` imprime o
   tempo por token (leitura, GPU, resto). Os experts em RAM ficam numa arena
   (um array por tensor, `[slots, ...]`), e cada camada roda um `gather_qmm`
-  por projeção indexado por slot. Com `experts_lo.bin` no pack
-  (`engine/packlo.py`, cópias em codebook de 2,5 bits) há uma segunda arena
-  e um kernel Metal próprio (`cbkernel.rs`). No 235B com 6 GB de cache (pico
+  por projeção indexado por slot. O prefill lê e roda os experts que faltam
+  em lotes (`--prefill-batch 32`, padrão; `0` = a camada toda de uma vez):
+  a arena guarda dois lotes, não uma camada inteira (Kimi: 1,9 GB em vez de
+  9,7). Toda chamada de prefill segue a regra de kernel do mlx-lm
+  (`segmented`/`run_q4_rows`): o MLX escolhe pelo array de pesos (segmentado
+  se linhas ≥ 4 × experts), então a chamada recebe um array só com os seus
+  experts quando o mlx-lm usaria o segmentado, e vai não ordenada quando não.
+  Passar a arena inteira faria o kernel depender do tamanho do cache. Com
+  `experts_lo.bin` no pack
+  (`engine/packlo.py`, gate/up em codebook de 2,5 bits e `down_proj` em q3
+  afim por padrão, `--down 3|4|cb`; `experts_lo.json` traz `down_bits`,
+  null = codebook) há uma segunda arena e um kernel Metal próprio
+  (`cbkernel.rs`); o `down` afim roda por `gather_qmm`. No 235B com 6 GB de cache (pico
   de 12 GB), `--bias 1`: só q4 3,3 tok/s; duas resoluções 3,4; `--lo-all`
   (tudo em codebook, ppl ×1,14) 6,3; com 10 GB, 9,0. Duas resoluções e bias
   disputam os mesmos picks de menor peso, e o bias ganha. Cada `eval` custa

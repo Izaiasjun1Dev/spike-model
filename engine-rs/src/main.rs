@@ -1,7 +1,7 @@
 //! moe-run: chat with a large MoE model whose experts stay on the SSD.
 //!
 //!   moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5]
-//!           [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--lo-all [--lo-prefill]] [--no-prefetch] [--dump-logits FILE]
+//!           [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--lo-all [--lo-prefill]] [--no-prefetch] [--prefill-batch 32] [--dump-logits FILE]
 //!           [--score IDS_FILE --n-prompt N --dump-logits FILE]   (teacher forcing, for tests)
 //!
 //! <pack> is a directory written by engine/pack.py.
@@ -34,13 +34,15 @@ struct Args {
     skip_last: bool,
     lo_all: bool,
     lo_prefill: bool,
+    /// Prefill misses read and run this many experts at a time (0: a whole layer).
+    prefill_batch: usize,
     /// Teacher forcing: a file of u32 token ids, and how many form the prompt.
     score: Option<PathBuf>,
     n_prompt: usize,
 }
 
 fn parse_args() -> Res<Args> {
-    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--lo-all [--lo-prefill]] [--no-prefetch] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
+    let usage = "usage: moe-run <pack> [-p PROMPT | --chat] [--cache-gb 8] [--bias 0.5] [--max-tokens 512] [--threads 16] [--lo-frac 0.4 | --no-tiered] [--no-skip-last] [--lo-all [--lo-prefill]] [--no-prefetch] [--prefill-batch 32] [--dump-logits FILE]\n       moe-run <pack> --score IDS_FILE --n-prompt N --dump-logits FILE   (teacher forcing, for tests)";
     let mut it = std::env::args().skip(1);
     let mut a = Args {
         pack: PathBuf::new(),
@@ -57,6 +59,7 @@ fn parse_args() -> Res<Args> {
         skip_last: true,
         lo_all: false,
         lo_prefill: false,
+        prefill_batch: 32,
         score: None,
         n_prompt: 0,
     };
@@ -77,6 +80,7 @@ fn parse_args() -> Res<Args> {
             "--no-skip-last" => a.skip_last = false,
             "--lo-all" => a.lo_all = true,
             "--lo-prefill" => a.lo_prefill = true,
+            "--prefill-batch" => a.prefill_batch = val()?.parse()?,
             "--score" => a.score = Some(val()?.into()),
             "--n-prompt" => a.n_prompt = val()?.parse()?,
             "-h" | "--help" => return Err(usage.into()),
@@ -187,19 +191,20 @@ fn run() -> Res<()> {
     mlx_rs::memory::set_cache_limit(512 << 20)?;
     let t0 = Instant::now();
     let tok = Tokenizer::from_file(args.pack.join("tokenizer.json")).map_err(|e| e.to_string())?;
-    let mut model = Model::load(&args.pack, args.cache_gb, if args.tiered { args.lo_frac } else { 0.0 }, args.lo_all, args.bias, args.threads)?;
+    let mut model = Model::load(&args.pack, args.cache_gb, if args.tiered { args.lo_frac } else { 0.0 }, args.lo_all, args.bias, args.threads, args.prefill_batch)?;
     model.prefetch = args.prefetch;
     model.lo_prefill = args.lo_prefill;
     model.skip_last_miss = args.skip_last && model.tiered;
     let st = model.stats();
     eprintln!(
-        "[loaded in {:.1}s, {} q4 + {} codebook experts cached per layer, arenas {:.1} GB, bias {}{}]\n",
+        "[loaded in {:.1}s, {} q4 + {} codebook experts cached per layer, arenas {:.1} GB, bias {}{}{}]\n",
         t0.elapsed().as_secs_f64(),
         st.cap_hi,
         st.cap_lo,
         st.arena_gb,
         args.bias,
-        if model.tiered { if model.skip_last_miss { ", tiered + skip last miss" } else { ", tiered" } } else { "" }
+        if model.tiered { if model.skip_last_miss { ", tiered + skip last miss" } else { ", tiered" } } else { "" },
+        if model.prefill_batch > 0 { format!(", prefill batch {}", model.prefill_batch) } else { String::new() }
     );
     let mut kv = model.new_cache();
     if let Some(path) = &args.score {

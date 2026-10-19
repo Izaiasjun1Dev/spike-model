@@ -6,6 +6,7 @@ forward pass). Greedy text is reported but not required to match: 1-ulp
 differences in gather_qmm flip a token now and then.
 
 Usage: uv run test_rust.py ~/packs/qwen3-30b [--bin ../engine-rs/target/release/moe-run] [--cache-gb 0.5,100]
+       [--long-prompt 800]   (adds a prompt of ~800 tokens: past ~64, mlx-lm switches gather_qmm kernels)
 """
 
 import argparse
@@ -28,13 +29,20 @@ def main():
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--cache-gb", default="0.5,100")
     ap.add_argument("--extra", default="", help="extra moe-run flags, e.g. '--no-prefetch'")
+    ap.add_argument("--long-prompt", type=int, default=0, help="also test a prompt of about this many tokens "
+                    "(text from the repository README)")
     ap.add_argument("--max-kl", type=float, help="pass on KL below this instead of the stock-noise rule "
                     "(two-resolution mode is expected to cost ~0.02 nats, tools/routing-trace/codebook.py)")
     args = ap.parse_args()
 
     stock, tok = load(args.model)
+    prompts = list(PROMPTS)
+    if args.long_prompt:
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+        text = tok.decode(tok.encode(readme)[: args.long_prompt])
+        prompts.append(f"Resuma em três frases:\n\n{text}")
     cases = []
-    for p in PROMPTS:
+    for p in prompts:
         prompt = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True,
                                          enable_thinking=False)
         text = generate(stock, tok, prompt, max_tokens=args.tokens)

@@ -1,0 +1,60 @@
+Fetching 12 files:   0%|          | 0/12 [00:00<?, ?it/s]Fetching 12 files: 100%|██████████| 12/12 [00:00<00:00, 5082.98it/s]
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Repo card metadata block was not found. Setting CardData to empty.
+calibrating on 512 code samples
+  calibration 0/512  1s
+  calibration 64/512  85s
+  calibration 128/512  168s
+  calibration 192/512  246s
+  calibration 256/512  340s
+  calibration 320/512  439s
+  calibration 384/512  522s
+  calibration 448/512  633s
+base         kimi  577.4 GB | code 86.7% (HE 91.5%, MBPP 83.7%) | MMLU 74.0% | ppl-code 3.172 ppl-en 9.476 ppl-pt 5.953 | 362s
+E25          kimi  434.7 GB | code 86.5% (HE 90.2%, MBPP 84.0%) | MMLU 63.5% | ppl-code 3.591 ppl-en 13.495 ppl-pt 115.962 | 338s
+E50          kimi  292.0 GB | code 84.6% (HE 89.6%, MBPP 81.3%) | MMLU 47.7% | ppl-code 4.431 ppl-en 25.337 ppl-pt 288.746 | 299s
+N30          kimi  406.2 GB | code 79.3% (HE 84.8%, MBPP 75.9%) | MMLU 58.5% | ppl-code 4.221 ppl-en 14.290 ppl-pt 11.490 | 320s
+N50          kimi  292.0 GB | code 62.9% (HE 65.2%, MBPP 61.5%) | MMLU 42.5% | ppl-code 5.676 ppl-en 28.718 ppl-pt 34.082 | 342s
+E50+N50      kimi  149.3 GB | code 62.7% (HE 58.5%, MBPP 65.4%) | MMLU 28.9% | ppl-code 7.891 ppl-en 68.549 ppl-pt 461.315 | 294s
+building mixed-precision experts
+  vq layer 0: rel err 0.226, 0.226
+  vq layer 1: rel err 0.226, 0.226
+  vq layer 2: rel err 0.226, 0.226
+  vq layer 3: rel err 0.226, 0.226
+  vq layer 4: rel err 0.226, 0.226
+  vq layer 5: rel err 0.226, 0.226
+  vq layer 6: rel err 0.226, 0.226
+  vq layer 7: rel err 0.226, 0.226
+  vq layer 8: rel err 0.226, 0.226
+  vq layer 9: rel err 0.226, 0.226
+  vq layer 10: rel err 0.226, 0.226
+  vq layer 11: rel err 0.226, 0.226
+  vq layer 12: rel err 0.226, 0.226
+  vq layer 13: rel err 0.226, 0.226
+  vq layer 14: rel err 0.226, 0.226
+  vq layer 15: rel err 0.226, 0.226
+  vq layer 16: rel err 0.226, 0.226
+  vq layer 17: rel err 0.226, 0.226
+  vq layer 18: rel err 0.226, 0.226
+  vq layer 19: rel err 0.226, 0.226
+  vq layer 20: rel err 0.226, 0.226
+  vq layer 21: rel err 0.226, 0.226
+  vq layer 22: rel err 0.226, 0.226
+  vq layer 23: rel err 0.226, 0.226
+  vq layer 24: rel err 0.226, 0.226
+  vq layer 25: rel err 0.226, 0.226
+  vq layer 26: rel err 0.226, 0.226
+  vq layer 27: rel err 0.226, 0.226
+  vq layer 28: rel err 0.226, 0.226
+  vq layer 29: rel err 0.226, 0.226
+  vq layer 30: rel err 0.226, 0.226
+  vq layer 31: rel err 0.226, 0.226
+  vq layer 32: rel err 0.226, 0.226
+  vq layer 33: rel err 0.226, 0.226
+  vq layer 34: rel err 0.226, 0.226
+  vq layer 35: rel err 0.226, 0.226
+  vq layer 36: rel err 0.226, 0.226
+  vq layer 37: rel err 0.226, 0.226
+  vq layer 38: rel err 0.226, 0.226
+/Users/izaiashenrique/.local/share/uv/python/cpython-3.14.7-macos-aarch64-none/lib/python3.14/multiprocessing/resource_tracker.py:475: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-0l9vgy7r'}
+  warnings.warn(

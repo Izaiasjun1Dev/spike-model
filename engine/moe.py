@@ -22,6 +22,7 @@ HERE = Path(__file__).resolve().parent
 ENGINE_RS = HERE.parent / "engine-rs"
 BIN = ENGINE_RS / "target/release/moe-run"
 PACKS = Path(os.environ.get("MOE_PACKS", Path.home() / "packs"))
+PREFILL_BATCH = 32  # moe-run's --prefill-batch default
 
 
 def run(cmd, **kw):
@@ -69,13 +70,20 @@ def budget(pack: Path, ram_gb: float, fast: bool) -> float:
     fixed = (pack / "model.safetensors").stat().st_size
     cfg = json.loads((pack / "config.json").read_text())
     hi = json.loads((pack / "experts.json").read_text())
-    experts, top_k = hi["experts"], cfg["num_experts_per_tok"]
-    spare = (experts + top_k) * hi["slot_bytes"]
+    experts, top_k, slot, n_moe = hi["experts"], cfg["num_experts_per_tok"], hi["slot_bytes"], hi["layers"]
+    spare = 0
     if fast:
         lo = json.loads((pack / "experts_lo.json").read_text())
         spare += (experts + 2 * top_k) * lo["slot_bytes"]
     margin = 1.5e9  # KV cache, activations, MLX's buffer cache
-    cache = ram_gb * 1e9 - fixed - spare - margin
+    room = ram_gb * 1e9 - fixed - spare - margin
+    # Besides the cache, the q4 arena holds the next layer's prefetches and,
+    # for moe-run's batched prefill, two batches of reads plus one layer's
+    # worth of cache (capped at a whole layer of experts).
+    cache = (room - (2 * PREFILL_BATCH + top_k) * slot) / (1 + 1 / n_moe)
+    if 2 * PREFILL_BATCH + cache / n_moe / slot >= experts:
+        cache = room - (experts + top_k) * slot
+    spare += room - cache
     if cache < 1e9:
         raise SystemExit(f"{ram_gb} GB is not enough: resident weights {fixed / 1e9:.1f} GB + spare slots "
                          f"{spare / 1e9:.1f} GB + margin 1.5 GB leave {cache / 1e9:.1f} GB for the cache")

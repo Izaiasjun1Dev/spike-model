@@ -271,6 +271,28 @@ velocidade, falta um kernel Metal que decodifique o codebook dentro do matmul
 (o MLX não tem). O d8 com 65.536 centróides ficou para depois (~4 h de
 k-means).
 
+**Precisão mista dentro do expert** (2026-10-13). Nos quants da comunidade
+para o Kimi-K2, subir só o `down_proj` de ~2 para ~3 bits leva a
+perplexidade de ×1,155 para ×1,078. Aqui, com gate/up no codebook d4 k1024
++ Hadamard e o `down_proj` em afim (todos os experts, mesmo corpus; a
+coluna de KL é em nats por token):
+
+| `down_proj` | bits/peso do expert | KL | top-1 | ppl |
+|---|---|---|---|---|
+| codebook (acima) | 2,50 | 0,185 | 84,3% | ×1,139 |
+| q3 afim g64 | 2,83 | 0,142 | 86,3% | ×1,132 |
+| q4 original | 3,17 | 0,133 | 87,4% | ×1,155 |
+| q3 afim em tudo (`quality.py`) | 3,50 | 0,138 | 88,4% | ×1,076 |
+
+O KL cai 23% com o `down` em q3, por 13% a mais de bytes, e chega ao nível
+do q3 em tudo com 19% menos bytes que ele. Mas a perplexidade quase não se
+move, e o "q4 original" dar ppl pior que o q3 mostra que o ppl deste corpus
+tem ruído de ±0,02 (o KL e o top-1 são as medidas confiáveis). No Qwen3-30B
+o erro do codebook está sobretudo em gate/up, não no `down`, diferente do
+que os quants do Kimi sugerem (lá o gate/up é um formato de 2 bits com
+matriz de importância, melhor que k-means puro). O `packlo.py --down 3`
+grava esse layout e o motor o roda com `gather_qmm` de 3 bits no `down`.
+
 Armadilha: a cópia em codebook do 30B tem ~29 bilhões de pesos. Guardada em 8
 bits, ela ocupa ~31 GB, além dos 16 GB do modelo, e a máquina de 48 GB entra
 em swap (uma avaliação levou 49 min). Em 5 bits cabe, e o `mx.set_cache_limit`

@@ -35,11 +35,15 @@ import mlx.core as mx
 from quality import Rotated, build_corpus, install, logprobs
 from mlx_lm import load
 
-VARIANTS = [  # (name, d, K, rotate)
-    ("vq d4 k256", 4, 256, False),
-    ("vq d4 k256 had", 4, 256, True),
-    ("vq d4 k1024 had", 4, 1024, True),  # 2.5 bits, same as affine q2 g64
-    ("vq d8 k65536 had", 8, 65536, True),  # ~4 h of k-means on an M5 Max
+VARIANTS = [  # (name, d, K, rotate, down_bits: None = codebook, 4 = stock q4, else affine re-quant)
+    ("vq d4 k256", 4, 256, False, None),
+    ("vq d4 k256 had", 4, 256, True, None),
+    ("vq d4 k1024 had", 4, 1024, True, None),  # 2.5 bits, same as affine q2 g64
+    ("vq d8 k65536 had", 8, 65536, True, None),  # ~4 h of k-means on an M5 Max
+    # Mixed precision inside the expert: the community's Kimi-K2 quants show
+    # down_proj is the cheapest projection to keep a bit higher.
+    ("vq d4 k1024 had down q3", 4, 1024, True, 3),  # 2.83 bits
+    ("vq d4 k1024 had down q4", 4, 1024, True, 4),  # 3.17 bits
 ]
 SAMPLE = 1 << 20  # vectors used to fit each codebook
 ITERS = 10
@@ -87,8 +91,11 @@ def vq(w: mx.array, d: int, k: int) -> tuple[mx.array, float]:
     return rec, err
 
 
-def vq_copy(sw, d: int, k: int, rotate: bool):
-    """Shallow copy of a quantized SwitchGLU with codebook-quantized experts."""
+def vq_copy(sw, d: int, k: int, rotate: bool, down_bits: int | None = None):
+    """Shallow copy of a quantized SwitchGLU with codebook-quantized experts.
+
+    down_bits: None keeps down_proj in the codebook too; 4 leaves the stock
+    q4 down_proj; another value re-quantizes it to that many affine bits."""
     lo = copy.copy(sw)
     errs = []
     for name in ("gate_proj", "up_proj", "down_proj"):
@@ -97,6 +104,13 @@ def vq_copy(sw, d: int, k: int, rotate: bool):
         dst._no_grad = set(getattr(src, "_no_grad", ()))
         w = mx.dequantize(src.weight, src.scales, src.biases, group_size=src.group_size, bits=src.bits)
         w = w.astype(mx.float32)
+        if name == "down_proj" and down_bits is not None:
+            if down_bits != src.bits:
+                dst.weight, dst.scales, dst.biases = mx.quantize(w, group_size=src.group_size, bits=down_bits)
+                dst.bits = down_bits
+                mx.eval(dst.weight, dst.scales, dst.biases)
+            setattr(lo, name, dst)
+            continue
         if rotate:
             w = mx.hadamard_transform(w)
         rec, err = vq(w, d, k)
@@ -127,6 +141,7 @@ def main():
     ap.add_argument("--seq-len", type=int, default=768)
     ap.add_argument("--json", type=Path, default=Path("traces/codebook.json"))
     ap.add_argument("--only", help="comma-separated variant names; merges into --json")
+    ap.add_argument("--rules", default="all,rank", help="which rules to score: all (every call), rank (picks 5-8)")
     args = ap.parse_args()
 
     mx.random.seed(0)
@@ -150,23 +165,24 @@ def main():
 
     results = json.loads(args.json.read_text())["variants"] if args.only and args.json.exists() else {}
     variants = [v for v in VARIANTS if not args.only or v[0] in args.only.split(",")]
-    for name, d, k, rotate in variants:
+    for name, d, k, rotate, down_bits in variants:
         t0 = time.time()
         for w in wraps:
             w.lo = None
         mx.clear_cache()
         errs = []
         for i, w in enumerate(wraps):
-            w.lo, e = vq_copy(w.block.switch_mlp, d, k, rotate)
+            w.lo, e = vq_copy(w.block.switch_mlp, d, k, rotate, down_bits)
             errs += e
-            print(f"  {name}: layer {i + 1}/{len(wraps)}, rel err {sum(e) / 3:.3f} ({time.time() - t0:.0f}s)",
+            print(f"  {name}: layer {i + 1}/{len(wraps)}, rel err {sum(e) / len(e):.3f} ({time.time() - t0:.0f}s)",
                   flush=True)
-        bits = math.log2(k) / d
-        for rule, label in (("all", "all"), ("rank", "rank 5-8")):
+        # bits per weight over the whole expert (gate and up are 2/3 of it)
+        bits = math.log2(k) / d if down_bits is None else (2 * math.log2(k) / d + (down_bits + 0.5)) / 3
+        for rule, label in [r for r in (("all", "all"), ("rank", "rank 5-8")) if r[0] in args.rules.split(",")]:
             for w in wraps:
                 w.rule = rule
             r = score(model, corpus, ref, ntok)
-            r.update({"d": d, "k": k, "rotate": rotate, "bits": bits, "rule": rule,
+            r.update({"d": d, "k": k, "rotate": rotate, "down_bits": down_bits, "bits": bits, "rule": rule,
                       "rel_err": sum(errs) / len(errs)})
             results[f"{name} {label}"] = r
             print(f"{name + ' ' + label:28s} {bits:.2f} b  err {r['rel_err']:.3f}  kl {r['kl']:.4f}  "

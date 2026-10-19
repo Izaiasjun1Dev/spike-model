@@ -383,6 +383,12 @@ impl LayerCache {
     /// (expert, lo copy?, slot) read for it. Returns the slots that leave
     /// (evicted, replaced, or read and not kept) as (lo, slot).
     pub fn update(&mut self, uses: &[(usize, bool, usize)], fetched: Vec<(usize, bool, usize)>) -> Vec<(bool, usize)> {
+        self.touch(uses);
+        self.admit(fetched)
+    }
+
+    /// Counts one call's uses: one tick of the decay clock.
+    pub fn touch(&mut self, uses: &[(usize, bool, usize)]) {
         self.clock += 1;
         for &(e, high, c) in uses {
             let (h, l) = self.scores(e);
@@ -390,6 +396,26 @@ impl LayerCache {
             self.lo_score[e] = l + if high { 0.0 } else { c as f64 };
             self.at[e] = self.clock;
         }
+    }
+
+    /// The q4 residents `admit` would keep if the experts in `new` were read
+    /// now, without changing anything. Admitting exactly the kept ones of
+    /// `new` later leaves the same residents as admitting all of them, so a
+    /// caller can decide before reading which reads to hold on to.
+    pub fn keeps_hi(&self, new: &[usize]) -> Vec<usize> {
+        let score = |e: usize| {
+            let (h, l) = self.scores(e);
+            h + l
+        };
+        let mut cand: Vec<usize> = self.hi.keys().chain(new.iter()).copied().collect();
+        cand.sort_by(|a, b| score(*b).total_cmp(&score(*a)).then(a.cmp(b)));
+        cand.truncate(self.cap_hi);
+        cand
+    }
+
+    /// Admits read copies that beat the weakest residents of their format
+    /// (after `touch` counted this call's uses). Returns the slots that leave.
+    pub fn admit(&mut self, fetched: Vec<(usize, bool, usize)>) -> Vec<(bool, usize)> {
         let mut gone = Vec::new();
         for lo in [false, true] {
             let new: Vec<(usize, usize)> = fetched.iter().filter(|f| f.1 == lo).map(|f| (f.0, f.2)).collect();

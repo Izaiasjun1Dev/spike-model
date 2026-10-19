@@ -262,7 +262,12 @@ bits (`cbq.py`: linhas normalizadas, rotação de Hadamard, 1024 vetores de 4
 pesos por camada e projeção; 0,56 dos bytes do q4; os resultados de qualidade
 estão em `tools/routing-trace/README.md`). O `moe-run` roda essas cópias com
 um kernel Metal próprio (`cbkernel.rs`), que reconstrói os pesos do codebook
-dentro da multiplicação. Dois modos:
+dentro da multiplicação. Desde 2026-10-13 o `down_proj` da cópia fica em q3
+afim por padrão (`--down 3`; `--down cb` mantém o codebook, `--down 4` copia
+o q4 do pack): 0,64 dos bytes do q4 em vez de 0,56, KL 0,14 em vez de 0,19
+nats no 30B com todos os picks em codebook, e o motor roda o `down` com
+`gather_qmm` de 3 bits (sem o Hadamard na dimensão do `down`, o que também
+libera o Moonlight-16B, cujo 1408 não é tamanho de Hadamard). Dois modos:
 
 - **duas resoluções** (padrão com `experts_lo.bin` no pack): a metade de
   menor peso dos picks usa qualquer cópia residente ou lê a cópia em
@@ -356,3 +361,134 @@ RESULT method=pread expert_bytes=2654208 topk=8 layers=48 lookahead=0 ... gbps=2
 - Expert repetido dentro da mesma rodada pode vir do page cache no `metal`/`mmap`
   (com 1 token do 235B num arquivo de 96 GB, ~4% das leituras; com 5 tokens, ~17%).
   Para o número de SSD puro, use `pread` ou poucos tokens com `resident_pct=0`.
+
+## Modo idêntico por faixa de RAM (2026-10-17)
+
+Qwen3-235B no `moe-run` em modo idêntico ao modelo de 4 bits: `--bias 0
+--no-tiered`, ou seja, roteador original, só experts q4, nada pulado (0
+leituras em codebook e 0 picks pulados em todas as rodadas). Antes da rodada,
+o `test_rust.py ~/packs/qwen3-30b --extra=--no-tiered` passou com KL de 1e-7 a
+1,1e-4 e top-1 100%. Cada rodada é um processo novo (cache e KV frios), 200
+tokens gulosos, três prompts (código em PT, chat em PT, matemática em EN), M5
+Max, `experts.bin` com 0% no page cache antes e depois. Log em
+`results/20261017-134215-235b-identical.log`.
+
+| cache de experts | pico MLX | ≈ Mac | acerto | GB/token | tok/s (3 prompts) | média |
+|---|---|---|---|---|---|---|
+| 6 GB | 12,0 GB | 16 GB | 22,5–29,6% | 5,5–6,4 | 2,10–2,53 | 2,35 |
+| 12 GB | 18,0 GB | 24 GB | 35,7–42,3% | 4,3–5,3 | 2,52–3,20 | 2,90 |
+| 18 GB | 24,0 GB | 32 GB | 45,6–51,1% | 3,5–4,4 | 3,28–4,16 | 3,78 |
+| 24 GB | 30,0 GB | 48 GB | 51,5–57,6% | 2,8–3,6 | 3,93–5,13 | 4,51 |
+
+A primeira palavra sai em 6,3–7,3 s (prompts de 38–69 tokens). Em todas as
+rodadas, GB/token × tok/s dá 13,2–14,5 GB/s: o SSD fica saturado, e o tok/s é
+a banda do SSD dividida pelos GB por token. Num Mac com SSD mais lento, a
+velocidade cai na mesma proporção. Os números são de resposta a frio; numa
+conversa longa o cache esquenta e o acerto sobe.
+
+O projeto mudou de pasta depois da compilação, e o `moe-run` procurava a
+`libmlx.dylib` no caminho antigo (estas rodadas usaram `DYLD_LIBRARY_PATH`).
+Recompilar com `MLX_SYSTEM_DIR` apontando para o `.venv` novo resolveu.
+
+Numa conversa de 6 turnos com o mesmo processo (cache e KV persistem; o 6º
+turno muda de assunto, de Rust para LGPD), 200 tokens por resposta, log em
+`results/20261017-140257-235b-identical-session.log`:
+
+| cache de experts | ≈ Mac | tok/s por turno | média | 1ª palavra (turnos 2–6) |
+|---|---|---|---|---|
+| 24 GB | 48 GB | 4,41 · 4,47 · 4,15 · 4,42 · 4,30 · 4,46 | 4,37 | 3,4–4,7 s |
+| 6 GB | 16 GB | 2,50 · 2,43 · 2,34 · 2,47 · 2,30 · 2,47 | 2,42 | 4,4–6,5 s |
+
+O cache não esquenta ao longo da conversa: o acerto se estabiliza já na
+primeira resposta, e trocar de assunto não custa nada. A resposta a frio da
+tabela anterior já é a velocidade de uso contínuo.
+
+### Kimi-K2-Instruct (1T) em modo idêntico (2026-10-17)
+
+Pack feito pelo `engine/pack.py` sem `--consume` (o download fica até o pack
+ser validado). O passo do tokenizer falhou: o `AutoTokenizer` exige
+`trust_remote_code` e a `transformers` instalada não lê o config do Kimi. O
+`tokenizer.json` foi montado a partir do do Moonlight (mesmo `tiktoken.model`,
+SHA-256 igual), com a regex trocada pela do `tokenization_kimi.py` (copiada,
+não executada) e 5 tokens especiais renomeados (`<|start_header_id|>`,
+`<|end_header_id|>`, `[EOT]`, `[UNK]`, `[PAD]`). Ele bate token a token com o
+tiktoken + regex da Moonshot em 41 de 41 amostras (34.652 tokens: PT, EN,
+chinês, código, CamelCase, emoji, template de chat).
+
+Atenção: o `tokenizer.json` do pack do Moonlight tem a regex genérica da
+conversão automática, sem `\p{Han}` e sem a separação por caixa da Moonshot,
+e erra 2 dessas 41 amostras. O `test_rust.py` não pega isso porque compara
+ids de tokens já prontos.
+
+Antes da rodada, `test_rust.py ~/packs/moonlight-16b --model
+mlx-community/Moonlight-16B-A3B-Instruct-4-bit --extra=--no-tiered` passou
+(caminho DeepSeek-V3: KL de 2e-4 a 2,9e-3, no nível do ruído do próprio
+modelo, top-1 98,5–100%). Mesmas condições do 235B (processo novo, 200
+tokens, três prompts); log em `results/20261017-163340-kimi-identical.log`.
+
+| cache de experts | pico MLX | ≈ Mac | acerto | GB/token | tok/s (3 prompts) | média |
+|---|---|---|---|---|---|---|
+| 3 GB | 19,6 GB | 24 GB | 7,8–13,6% | 11,1–12,1 | 1,23–1,36 | 1,29 |
+| 8 GB | 24,0 GB | 32 GB | 13,9–22,1% | 9,9–11,2 | 1,32–1,54 | 1,42 |
+| 16 GB | 31,5 GB | 48 GB | 20,7–28,4% | 9,0–10,3 | 1,44–1,70 | 1,56 |
+
+A primeira palavra leva 15–21 s (prompts de 41–75 tokens). O SSD fica em
+14,8–15,4 GB/s em todas as rodadas. O mínimo de memória é ~18 GB mesmo com
+cache zero: além dos 6,8 GB fixos, a arena reserva uma camada inteira de
+experts para o prefill (`experts + top_k` slots = 392 × 23,6 MiB = 9,7 GB).
+Processar o prefill em lotes de experts reduziria essa reserva sem mudar o
+resultado e é o que falta para o Kimi caber num Mac de 16 GB.
+
+### Prefill em lotes e o kernel do mlx-lm (2026-10-17)
+
+O `moe-run` reservava na arena uma camada inteira de experts para o prefill
+(`experts + top_k` slots): 9,7 GB no Kimi. Agora o prefill lê e roda os
+experts que faltam em lotes (`--prefill-batch 32`, o padrão; `0` volta ao
+antigo), com a leitura do lote seguinte sobreposta à GPU do atual. A decisão
+do cache depende só dos usos da chamada, então é tomada antes de ler, e só as
+leituras que o cache admite seguram o slot além do seu lote: o cache termina
+igual ao do caminho antigo. A arena passa a ter `2 × lote + 1 camada de cache
++ top_k` slots além do cache.
+
+Ao validar com um prompt longo (`test_rust.py --long-prompt 800`, opção nova),
+apareceu um defeito antigo. O MLX escolhe o kernel do `gather_qmm` pela razão
+linhas/experts do array de pesos (segmentado se ≥ 16 linhas, índices
+ordenados e linhas ≥ 4 × experts; senão, um produto matriz-vetor por linha),
+e os dois arredondam diferente. O mlx-lm passa os experts da camada (128 no
+Qwen3: segmentado a partir de 64 tokens); o motor passava a arena inteira,
+então o kernel dependia do tamanho do cache. Agora toda chamada de prefill
+segue a regra do mlx-lm: quando ele usaria o segmentado, a chamada recebe um
+array só com os seus experts (preenchido com linhas nulas até 4 por expert);
+senão, vai marcada como não ordenada. Os dois kernels dão a cada linha os
+mesmos bits qualquer que seja a divisão em chamadas, o que torna o lote exato.
+
+| teste (KL contra o mlx-lm) | motor antigo | motor novo (lote 32) |
+|---|---|---|
+| Qwen3-30B, prompt de 810 tokens, cache 0,5 GB | 1,5e-8 | 1,5e-8 |
+| Qwen3-30B, prompt de 810 tokens, cache 100 GB | **1,27e-2 (falha)** | 1,5e-8 |
+| Qwen3-30B, prompt de 124 tokens | cache-dependente | ~1e-7 |
+| Moonlight, prompt de 787 tokens, cache 0,5 GB | 1,27e-3 (falha) | 1,27e-3 (falha) |
+| Moonlight, prompt de 787 tokens, cache 100 GB | 1,63e-3 (falha) | 1,27e-3 (falha) |
+| `test_rust.py` padrão, Qwen3-30B e Moonlight | passa | passa |
+
+Com e sem lote, o motor novo dá logits bit a bit iguais, o mesmo texto e as
+mesmas estatísticas de cache em 12 casos (Qwen3-30B e Moonlight; prompts de
+28–33, 124–125 e 787–810 tokens; caches de 0,5 e 40 GB). O desvio do
+Moonlight em prompt longo (2,2× o ruído do modelo, top-1 100%) já existia e
+não vem dos experts: fica na arquitetura DeepSeek-V3 (provavelmente a
+atenção MLA em sequências longas) e falta investigar.
+
+Kimi-K2, mesmo prompt de 60 tokens, 40 tokens gerados
+(`results/20261017-175352-kimi-prefill-batch.log`):
+
+| cache | lote | arena | pico MLX | prefill | decode |
+|---|---|---|---|---|---|
+| 8 GB | 0 | 17,1 GB | 24,0 GB | 3,3 tok/s | 1,47 tok/s |
+| 8 GB | 32 | 9,3 GB | **16,2 GB** | 3,4 tok/s | 1,47 tok/s |
+| 8 GB | 64 | 10,9 GB | 17,8 GB | 3,4 tok/s | 1,47 tok/s |
+| 1,5 GB | 32 | 3,3 GB | **10,2 GB** | 3,4 tok/s | 1,24 tok/s |
+
+O prefill não perde velocidade, e o Kimi passa a rodar em modo idêntico com
+pico de 10,2 GB, o que cabe num Mac de 16 GB. O `moe.py` calcula a reserva
+com o lote (`PREFILL_BATCH`); num Mac de 16 GB, 70% da RAM deixa ~1 GB de
+cache para o Kimi.

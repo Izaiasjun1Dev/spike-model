@@ -3,7 +3,7 @@
 //! and deepseek_v3.py (absorbed MLA attention, sigmoid router with the
 //! correction bias, shared experts, leading dense layers, YaRN RoPE).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use mlx_rs::fast::{self, ScaledDotProductAttentionMask};
@@ -268,13 +268,21 @@ pub struct Model {
     pub lo_all: bool,
     /// Prefill with codebook copies too (faster, costs more quality).
     pub lo_prefill: bool,
+    /// A prefill reads and runs its missing q4 experts this many at a time
+    /// (0: all of a layer at once), so the arena holds two batches instead
+    /// of a whole layer. Same results either way.
+    pub prefill_batch: usize,
     pub skipped: u64,
     /// Prefetched as a codebook copy, then needed as q4.
     pub prefetch_lo_wrong: u64,
     /// Prefetches in flight, per expert layer, keyed by (expert, lo copy?).
     pending: Vec<HashMap<(usize, bool), Pending>>,
-    /// Codebooks per expert layer: [gate, up, down], each [K, D] f16.
-    codebooks: Vec<[Array; 3]>,
+    /// Codebooks per expert layer: [gate, up] and, when the low copy keeps
+    /// down_proj in the codebook too, [gate, up, down]; each [K, D] f16.
+    codebooks: Vec<Vec<Array>>,
+    /// (bits, group_size) of the low copy's affine down_proj; None when it
+    /// is in the codebook.
+    lo_down: Option<(i32, i32)>,
     kernels: Kernels,
 }
 
@@ -319,17 +327,19 @@ fn yarn_mscale(scale: f32, mscale: f32) -> f32 {
 impl Model {
     /// `cache_gb` is the RAM for experts; `lo_frac` of it holds codebook
     /// copies when the pack has them (0 disables the two-resolution mode).
-    pub fn load(pack: &Path, cache_gb: f64, lo_frac: f64, lo_all: bool, bias: f32, threads: usize) -> Res<Self> {
+    /// `prefill_batch`: see the field of that name.
+    pub fn load(pack: &Path, cache_gb: f64, lo_frac: f64, lo_all: bool, bias: f32, threads: usize, prefill_batch: usize) -> Res<Self> {
         let cfg = Config::load(pack)?;
         let n_moe = cfg.moe_layers.len();
         let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts.json"))?)?;
         let hi_bytes = meta["slot_bytes"].as_u64().ok_or("experts.json: slot_bytes")? as usize;
         let tiered = lo_frac > 0.0 && pack.join("experts_lo.bin").exists();
-        let lo_bytes = if tiered {
+        let (lo_bytes, lo_down) = if tiered {
             let m: serde_json::Value = serde_json::from_slice(&std::fs::read(pack.join("experts_lo.json"))?)?;
-            m["slot_bytes"].as_u64().ok_or("experts_lo.json: slot_bytes")? as usize
+            let down = m["down_bits"].as_i64().map(|b| (b as i32, m["group_size"].as_i64().unwrap_or(cfg.group_size as i64) as i32));
+            (m["slot_bytes"].as_u64().ok_or("experts_lo.json: slot_bytes")? as usize, down)
         } else {
-            0
+            (0, None)
         };
         let lo_frac = if tiered { lo_frac } else { 0.0 };
         let per_layer = cache_gb * 1e9 / n_moe as f64;
@@ -337,9 +347,13 @@ impl Model {
         let cap_lo = if tiered { ((per_layer * lo_frac) as usize / lo_bytes).min(cfg.experts) } else { 0 };
         // Besides the caches, the arenas need room for one layer's misses in
         // a prefill (up to every expert, q4) and the next layer's prefetches.
+        // A batched prefill instead holds two batches of reads plus the misses
+        // its layer's cache admits, which stay until the layer ends.
+        let prefill_batch = if prefill_batch > 0 { prefill_batch.max(cfg.top_k) } else { 0 };
+        let prefill_room = if prefill_batch > 0 { (2 * prefill_batch + cap_hi).min(cfg.experts) } else { cfg.experts };
         let store = Store::open(
             pack,
-            n_moe * cap_hi + cfg.experts + cfg.top_k,
+            n_moe * cap_hi + prefill_room + cfg.top_k,
             // With every pick in codebook, a prefill may read all experts.
             if tiered { n_moe * cap_lo + 2 * cfg.top_k + if lo_all { cfg.experts } else { 0 } } else { 0 },
             threads,
@@ -348,9 +362,13 @@ impl Model {
             let cb = Array::load_safetensors(pack.join("codebooks.safetensors"))?;
             cfg.moe_layers
                 .iter()
-                .map(|l| -> Res<[Array; 3]> {
+                .map(|l| -> Res<Vec<Array>> {
                     let get = |p: &str| cb.get(&format!("layers.{l}.{p}")).cloned().ok_or_else(|| format!("missing codebook layers.{l}.{p}"));
-                    Ok([get("gate_proj")?, get("up_proj")?, get("down_proj")?])
+                    let mut v = vec![get("gate_proj")?, get("up_proj")?];
+                    if lo_down.is_none() {
+                        v.push(get("down_proj")?);
+                    }
+                    Ok(v)
                 })
                 .collect::<Res<Vec<_>>>()?
         } else {
@@ -445,9 +463,11 @@ impl Model {
             skip_last_miss: tiered,
             lo_all: lo_all && tiered,
             lo_prefill: false,
+            prefill_batch,
             skipped: 0,
             prefetch_lo_wrong: 0,
             codebooks,
+            lo_down,
             kernels: Kernels::new(),
         };
         if let Some(k) = w.keys().next() {
@@ -716,6 +736,12 @@ impl Model {
         let mut uses: Vec<(usize, bool, usize)> = uses.into_iter().map(|((e, high), c)| (e, high, c)).collect();
         uses.sort_unstable();
 
+        if !decode && self.prefill_batch > 0 && !need_lo.iter().any(|&l| l) {
+            // Every pick is a resident q4 copy or a q4 read.
+            let resident: Vec<Option<usize>> = serve.iter().map(|s| if let Serve::Hi(slot) = s { Some(*slot) } else { None }).collect();
+            return self.moe_prefill_batched(i, x, &picks, &weights, &resident, &uses);
+        }
+
         // Misses: take over a prefetch already under way, else read on demand.
         let mut reads: HashMap<(usize, bool), Pending> = HashMap::new();
         for (j, &e) in picks.iter().enumerate() {
@@ -814,20 +840,18 @@ impl Model {
         }
         let mut parts: Vec<Array> = Vec::new();
         let mut order: Vec<usize> = Vec::new(); // row j of each output row, in order
-        if !hi_rows.is_empty() {
-            let toks: Vec<u32> = hi_rows.iter().map(|&(j, _)| (j / k) as u32).collect();
+        if !hi_rows.is_empty() && n_tok > 1 {
+            parts.push(self.run_q4_rows(&x_flat, &hi_rows, self.segmented(n_rows))?);
+            order.extend(hi_rows.iter().map(|&(j, _)| j));
+        } else if !hi_rows.is_empty() {
+            // Decode: the token's x broadcast over its picks, unsorted as in mlx-lm.
             let slots: Vec<u32> = hi_rows.iter().map(|&(_, s)| s).collect();
-            let hs = if n_tok == 1 {
-                ops::expand_dims_axes(x, &[-2, -3])? // [1, 1, 1, 1, hidden], broadcast over the rows
-            } else {
-                ops::expand_dims_axes(&take_axis(&x_flat, &Array::from_slice(&toks, &[toks.len() as i32]), 0)?, &[1])? // [n, 1, hidden]
-            };
-            let is = if n_tok == 1 { Array::from_slice(&slots, &[1, 1, slots.len() as i32]) } else { Array::from_slice(&slots, &[slots.len() as i32]) };
-            let sorted = n_tok > 1 && slots.len() >= 64;
-            let up = qmm(&hs, "up_proj", &is, sorted)?;
-            let gate = qmm(&hs, "gate_proj", &is, sorted)?;
+            let hs = ops::expand_dims_axes(x, &[-2, -3])?; // [1, 1, 1, 1, hidden]
+            let is = Array::from_slice(&slots, &[1, 1, slots.len() as i32]);
+            let up = qmm(&hs, "up_proj", &is, false)?;
+            let gate = qmm(&hs, "gate_proj", &is, false)?;
             let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
-            parts.push(ops::reshape(&qmm(&act, "down_proj", &is, sorted)?, &[slots.len() as i32, hidden])?);
+            parts.push(ops::reshape(&qmm(&act, "down_proj", &is, false)?, &[slots.len() as i32, hidden])?);
             order.extend(hi_rows.iter().map(|&(j, _)| j));
         }
         if !lo_rows.is_empty() {
@@ -837,15 +861,28 @@ impl Model {
             let eids = Array::from_slice(&slots, &[slots.len() as i32]);
             let xr = hadamard(&x_flat.as_type::<f32>()?)?; // [n_tok, hidden]
             let xr = if n_tok == 1 { xr } else { take_axis(&xr, &Array::from_slice(&toks, &[toks.len() as i32]), 0)? };
-            let [cb_gate, cb_up, cb_down] = &self.codebooks[xl];
+            let cbs = &self.codebooks[xl];
             let act = self.kernels.gate_up(
                 &xr, &eids,
                 lo.array("gate_proj.codes"), lo.array("up_proj.codes"),
                 lo.array("gate_proj.scale"), lo.array("up_proj.scale"),
-                cb_gate, cb_up,
+                &cbs[0], &cbs[1],
             )?; // [n, inter] f32, silu(gate) * up
-            let ar = hadamard(&act)?;
-            parts.push(self.kernels.qmv(&ar, &eids, lo.array("down_proj.codes"), lo.array("down_proj.scale"), cb_down, dtype)?);
+            let y = match self.lo_down {
+                // Affine down_proj: one gather_qmm over the low arena, each
+                // row with its own activation (no rotation: W, not W·H).
+                Some((bits, gs)) => {
+                    let hs = ops::expand_dims_axes(&act.as_dtype(dtype)?, &[1])?; // [n, 1, inter]
+                    let t = |n: &str| lo.array(&format!("down_proj.{n}"));
+                    let y = ops::gather_qmm(&hs, t("weight"), t("scales"), t("biases"), None, &eids, true, gs, bits, false)?;
+                    ops::reshape(&y, &[slots.len() as i32, hidden])?
+                }
+                None => {
+                    let ar = hadamard(&act)?;
+                    self.kernels.qmv(&ar, &eids, lo.array("down_proj.codes"), lo.array("down_proj.scale"), &cbs[2], dtype)?
+                }
+            };
+            parts.push(y);
             order.extend(lo_rows.iter().map(|&(j, _)| j));
         }
         let n_skip = serve.iter().filter(|s| matches!(s, Serve::Skip)).count();
@@ -876,6 +913,194 @@ impl Model {
         let gone = self.layers[i].cache.update(&uses, fetched);
         self.store.release(gone);
         Ok(out)
+    }
+
+    /// A prefill whose missing q4 experts are read and run `prefill_batch` at
+    /// a time, the next batch's reads overlapping this batch's GPU work. Same
+    /// output and same cache afterwards as the unbatched path: the cache's
+    /// choice depends only on this call's uses, so it is made before reading,
+    /// and only the reads it keeps hold their slots past their batch.
+    fn moe_prefill_batched(
+        &mut self,
+        i: usize,
+        x: &Array,
+        picks: &[usize],
+        weights: &[f32],
+        resident: &[Option<usize>],
+        uses: &[(usize, bool, usize)],
+    ) -> Res<Array> {
+        let k = self.cfg.top_k;
+        let xl = self.layers[i].xl;
+        let n_tok = x.shape()[1] as usize;
+        let hidden = x.shape()[2];
+        let dtype = x.dtype();
+        let n_rows = picks.len();
+        let x_flat = ops::reshape(x, &[n_tok as i32, hidden])?;
+        let segmented = self.segmented(n_rows);
+
+        let mut misses: Vec<usize> = picks.iter().zip(resident).filter(|(_, r)| r.is_none()).map(|(&e, _)| e).collect();
+        misses.sort_unstable();
+        misses.dedup();
+        let mut rows_of: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (j, &e) in picks.iter().enumerate() {
+            if resident[j].is_none() {
+                rows_of.entry(e).or_default().push(j);
+            }
+        }
+        let cache = &mut self.layers[i].cache;
+        cache.touch(uses);
+        let keep: HashSet<usize> = cache.keeps_hi(&misses).into_iter().collect();
+
+        // Prefetches under way for this layer: take over the needed ones,
+        // drop the rest. (A finished token leaves none, so this is a guard.)
+        let mut taken: HashMap<usize, Pending> = HashMap::new();
+        let pending: Vec<((usize, bool), Pending)> = self.pending[xl].drain().collect();
+        for ((e, lo), p) in pending {
+            let needed = misses.binary_search(&e).is_ok();
+            if !lo && needed {
+                self.store.promote(&p);
+                self.store.prefetch_used += 1;
+                taken.insert(e, p);
+            } else {
+                if lo && needed {
+                    self.prefetch_lo_wrong += 1;
+                }
+                self.store.discard(p)?;
+            }
+        }
+
+        let mut parts: Vec<Array> = Vec::new();
+        let mut order: Vec<usize> = Vec::new(); // row j of each output row, in order
+        // Resident rows first: their slots stay put until the layer ends.
+        let mut res_rows: Vec<(usize, u32)> = resident.iter().enumerate().filter_map(|(j, r)| r.map(|s| (j, s as u32))).collect();
+        res_rows.sort_by_key(|&(_, slot)| slot);
+        if !res_rows.is_empty() {
+            parts.push(self.run_q4_rows(&x_flat, &res_rows, segmented)?);
+            order.extend(res_rows.iter().map(|&(j, _)| j));
+        }
+
+        let chunks: Vec<&[usize]> = misses.chunks(self.prefill_batch).collect();
+        let mut admitted: Vec<(usize, bool, usize)> = Vec::new();
+        let mut inflight = match chunks.first() {
+            Some(c) => Some(self.start_reads(xl, c, &mut taken)?),
+            None => None,
+        };
+        for ci in 0..chunks.len() {
+            let mut got: Vec<(usize, usize)> = Vec::new();
+            for (e, p) in inflight.take().unwrap() {
+                got.push((e, self.store.finish(p)?));
+            }
+            let mut rows: Vec<(usize, u32)> = got.iter().flat_map(|&(e, slot)| rows_of[&e].iter().map(move |&j| (j, slot as u32))).collect();
+            rows.sort_by_key(|&(_, slot)| slot);
+            let y = self.run_q4_rows(&x_flat, &rows, segmented)?;
+            order.extend(rows.iter().map(|&(j, _)| j));
+            if let Some(c) = chunks.get(ci + 1) {
+                inflight = Some(self.start_reads(xl, c, &mut taken)?);
+            }
+            // The batch's slots can take new reads once its work has run.
+            y.eval()?;
+            let mut done = Vec::new();
+            for (e, slot) in got {
+                if keep.contains(&e) {
+                    admitted.push((e, false, slot));
+                } else {
+                    done.push((false, slot));
+                }
+            }
+            self.store.release(done);
+            parts.push(y);
+        }
+
+        // Rows back in router order, then each token's k rows summed with
+        // their weights: the unbatched path's arithmetic.
+        parts.push(ops::zeros_dtype(&[1, hidden], dtype)?);
+        let y_all = ops::concatenate(&parts, 0)?;
+        let mut pos = vec![n_rows as u32; n_rows];
+        for (p, &j) in order.iter().enumerate() {
+            pos[j] = p as u32;
+        }
+        let y = take_axis(&y_all, &Array::from_slice(&pos, &[n_rows as i32]), 0)?;
+        let w = Array::from_slice(weights, &[n_tok as i32, k as i32, 1]).as_dtype(dtype)?;
+        let y = ops::reshape(&y, &[n_tok as i32, k as i32, hidden])?;
+        let out = ops::reshape(&ops::sum_axis(&ops::multiply(&y, &w)?, 1, false)?, &[1, n_tok as i32, hidden])?;
+
+        let gone = self.layers[i].cache.admit(admitted);
+        self.store.release(gone);
+        Ok(out)
+    }
+
+    /// Demand reads for `experts` of expert layer `xl`, taking over the
+    /// prefetches in `taken`.
+    fn start_reads(&mut self, xl: usize, experts: &[usize], taken: &mut HashMap<usize, Pending>) -> Res<Vec<(usize, Pending)>> {
+        experts
+            .iter()
+            .map(|&e| {
+                let p = match taken.remove(&e) {
+                    Some(p) => p,
+                    None => self.store.start(xl, e, false, true)?.ok_or("expert arena full")?,
+                };
+                Ok((e, p))
+            })
+            .collect()
+    }
+
+    /// Whether mlx-lm runs a prefill of `n_rows` picks on the segmented
+    /// gather_qmm kernel: MLX picks it for sorted indices with at least 16
+    /// rows and 4 per expert of the weight array, and mlx-lm sorts from 64
+    /// rows and passes the layer's experts.
+    fn segmented(&self, n_rows: usize) -> bool {
+        n_rows >= 64 && n_rows / self.cfg.experts >= 4
+    }
+
+    /// Prefill rows (row j, q4 arena slot), sorted by slot, through one
+    /// gather_qmm per projection (mlx-lm's SwitchGLU math): [rows, hidden].
+    ///
+    /// The kernel must be the one mlx-lm's prefill runs (`segmented`), but
+    /// MLX decides from the weight array the call gets, and the arena has any
+    /// number of slots. So a segmented call gets a weight array of just its
+    /// experts, padded with zero rows to 4 per expert, and any other call is
+    /// marked unsorted, which keeps it on the one-row-at-a-time kernel. Both
+    /// kernels give each row the same bits however the rows are split into
+    /// calls, which is what lets the prefill run in batches.
+    fn run_q4_rows(&self, x_flat: &Array, rows: &[(usize, u32)], segmented: bool) -> Res<Array> {
+        let k = self.cfg.top_k;
+        let hidden = x_flat.shape()[1];
+        let (gs, bits) = (self.store.group_size, self.store.bits);
+        let hi = &self.store.hi;
+        let n = rows.len();
+        let toks: Vec<u32> = rows.iter().map(|&(j, _)| (j / k) as u32).collect();
+        let mut hs = take_axis(x_flat, &Array::from_slice(&toks, &[n as i32]), 0)?; // [n, hidden]
+        let (idx, experts, pad) = if segmented {
+            let mut uniq: Vec<u32> = rows.iter().map(|&(_, s)| s).collect();
+            uniq.dedup();
+            let mut local: Vec<u32> = rows.iter().map(|&(_, s)| uniq.binary_search(&s).unwrap() as u32).collect();
+            // Zero rows on the last expert keep the indices sorted.
+            let pad = (4 * uniq.len()).max(16).saturating_sub(n);
+            local.extend(std::iter::repeat_n(uniq.len() as u32 - 1, pad));
+            (Array::from_slice(&local, &[(n + pad) as i32]), Some(Array::from_slice(&uniq, &[uniq.len() as i32])), pad)
+        } else {
+            let slots: Vec<u32> = rows.iter().map(|&(_, s)| s).collect();
+            (Array::from_slice(&slots, &[n as i32]), None, 0)
+        };
+        if pad > 0 {
+            hs = ops::concatenate(&[hs.clone(), ops::zeros_dtype(&[pad as i32, hidden], hs.dtype())?], 0)?;
+        }
+        let hs = ops::expand_dims_axes(&hs, &[1])?; // [n + pad, 1, hidden]
+        let qmm = |h: &Array, part: &str| -> Res<Array> {
+            let t = |name: &str| -> Res<Array> {
+                let a = hi.array(&format!("{part}.{name}"));
+                Ok(match &experts {
+                    Some(e) => take_axis(a, e, 0)?,
+                    None => a.clone(),
+                })
+            };
+            Ok(ops::gather_qmm(h, &t("weight")?, &t("scales")?, &t("biases")?, None, &idx, true, gs, bits, segmented)?)
+        };
+        let up = qmm(&hs, "up_proj")?;
+        let gate = qmm(&hs, "gate_proj")?;
+        let act = ops::multiply(&mlx_rs::nn::silu(&gate)?, &up)?;
+        let y = ops::reshape(&qmm(&act, "down_proj")?, &[(n + pad) as i32, hidden])?;
+        Ok(if pad > 0 { ops::split_at_indices(&y, &[n as i32], 0)?.swap_remove(0) } else { y })
     }
 }
 
